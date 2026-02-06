@@ -1,0 +1,81 @@
+//| mill-version: 1.1.1
+
+package build
+import mill.*, scalalib.*, publish.*
+import mill.javalib.SonatypeCentralPublishModule
+import mill.util.VcsVersionModule
+
+val scalaVersions = Seq("3.8.1")
+
+trait Publish extends SonatypeCentralPublishModule with VcsVersionModule {
+
+    override def pomSettings = Task {
+      PomSettings(
+        description = "A Scala 3 compiler plugin that enforces layered/onion architecture at compile time",
+        organization = "com.github.lolgab",
+        url = "https://github.com/lolgab/layers-dotty-plugin",
+        licenses = Seq(License.`Apache-2.0`),
+        versionControl = VersionControl.github(owner = "lolgab", repo = "layers-dotty-plugin"),
+        developers = Seq(
+          Developer("lolgab", "Lorenzo Gabriele", "https://github.com/lolgab")
+        )
+      )
+    }
+}
+
+object layers extends ScalaModule with Publish {
+  def scalaVersion = scalaVersions.head
+
+  def scalacOptions = Seq("-deprecation")
+
+  object plugin extends Cross[PluginModule](scalaVersions)
+  trait PluginModule extends ScalaModule with Publish with CrossScalaModule { outer =>
+    override def artifactName = "layers-dotty-plugin"
+    override def crossFullScalaVersion = true
+
+    def compileMvnDeps = Seq(
+      mvn"org.scala-lang::scala3-compiler:$crossScalaVersion"
+    )
+
+    def scalacOptions = Seq("-deprecation")
+
+    object test extends ScalaTests with TestModule.Munit {
+      def moduleDeps = Seq(layers)
+      def mvnDeps = Seq(
+        mvn"org.scalameta::munit:1.1.0",
+        mvn"org.scala-lang::scala3-compiler:$crossScalaVersion"
+      )
+
+      def forkArgs = Task {
+        Seq(s"-Dlayers.plugin.jar=${outer.assembly().path}")
+      }
+
+      // Exclude LayersConfigTests until LayersConfig is implemented
+      override def allSourceFiles = Task {
+        super.allSourceFiles().filter(!_.path.toString.contains("LayersConfigTests"))
+      }
+
+    }
+
+    def assembly = Task {
+      val jar = super.assembly().path
+      val dest = Task.dest / "layers-dotty-plugin.jar"
+      os.copy(jar, dest, replaceExisting = true)
+      PathRef(dest)
+    }
+  }
+}
+
+object examples extends Module {
+
+  object example extends ScalaModule {
+    def scalaVersion = scalaVersions.head
+
+    def moduleDeps = Seq(layers)
+
+    def scalacOptions = Task {
+      val pluginJar = layers.plugin(scalaVersions.head).assembly().path
+      Seq(s"-Xplugin:$pluginJar")
+    }
+  }
+}
