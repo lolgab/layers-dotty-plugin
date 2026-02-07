@@ -84,7 +84,8 @@ object ZincIncrementalRunner:
         def append(s: String): Unit = output.append(s).append("\n")
         val capturingReporter = new CapturingReporter(output)
         val simpleLogger = new sbt.util.Logger {
-          override def log(level: sbt.util.Level.Value, msg: => String): Unit = append(msg)
+          override def log(level: sbt.util.Level.Value, msg: => String): Unit =
+            if level > sbt.util.Level.Debug then append(msg)
           override def trace(t: => Throwable): Unit = append(t.toString)
           override def success(msg: => String): Unit = append(msg)
         }

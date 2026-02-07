@@ -88,6 +88,16 @@ class Service
     assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
   }
 
+  test("package with no layer object uses hash_nolayers") {
+    val sources = List(
+      "Service.scala" -> """package app
+class Service(s: String)
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
+    assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
+  }
+
   test("maxLayers limits number of layers - fails when exceeded") {
     val sources = List(
       "DomainLayer.scala" -> """package domain

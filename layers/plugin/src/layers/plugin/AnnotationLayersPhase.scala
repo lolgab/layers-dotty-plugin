@@ -37,11 +37,19 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
   /** Package -> hash hex for Zinc invalidation. Hash derived from @dependsOn content. */
   private val packageToHashHex = mutable.Map[String, String]()
 
+  /** Special hash used when a package has no layer object. Ensures Zinc invalidation semantics. */
+  private val noLayersHash = "nolayers"
+
+  /** Packages we've seen in the tree traversal (for second-pass package symbol fallback). */
+  private val packagesSeenInTree = mutable.Set[String]()
+
   private val maxLayers: Option[Int] =
     options.collectFirst { case s if s.startsWith("maxLayers=") => s.drop(10).trim.toIntOption }.flatten.filter(_ > 0)
 
   override def run(using ctx: Context): Unit =
     val units = ctx.run.nn.units
+    // Pass 1: collect @dependsOn from trees only. This uses fresh data from the current run.
+    // During incremental compilation, package symbol lookup may return stale classpath symbols.
     for unit <- units do
       if !unit.tpdTree.isEmpty then
         validateDependsOnPlacement(unit.tpdTree)
@@ -50,6 +58,11 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
         else None
         collectDependsOnFromTree(unit.tpdTree, sourceContent)
         collectDependsOnFromSymbols(unit.tpdTree, sourceContent)
+    // Pass 2: for packages we've seen but don't have layer info from trees, fall back to
+    // package symbol (classpath). Handles e.g. compiling only Service.scala when layer.scala
+    // is not in this run.
+    for pkg <- packagesSeenInTree do
+      if !packageToAllowed.contains(pkg) then collectDependsOnFromPackageSymbol(pkg)
     maxLayers.foreach { limit =>
       val layerCount = packageToAllowed.size
       if layerCount > limit then
@@ -115,6 +128,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     tree match
       case PackageDef(pid, stats) =>
         val pkgName = packageNameFromTree(pid)
+        if pkgName.nonEmpty && pkgName != "root" then packagesSeenInTree += pkgName
         for stat <- stats do
           if stat.symbol.exists then
             val sym = stat.symbol
@@ -124,7 +138,6 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
               val allowed = extractDependsOnFromSymbol(if sym.is(Flags.ModuleVal) then sym else sym.sourceModule)
               packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
               packageToHashHex(pkgName) = dependsOnHash(allowed, sourceContent)
-        collectDependsOnFromPackageSymbol(pkgName)
         for stat <- stats do collectDependsOnFromTree(stat, sourceContent)
       case _ =>
 
@@ -134,21 +147,21 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
       case Select(qual, name) => s"${packageNameFromTree(qual)}.${name}"
       case _ => ""
 
-  /** Look up the layer object from the package symbol (handles layer objects in other files). */
+  /** Look up the layer object from the classpath (preferred) or package symbol.
+    * During Zinc incremental compilation, only a subset of sources may be in the run (e.g. only
+    * Service.scala when layer.scala was compiled in a previous cycle). Fetch from classpath first
+    * via requiredModule so we find layers not compiled in this run.
+    */
   private def collectDependsOnFromPackageSymbol(pkgName: String)(using Context): Unit =
     if pkgName.isEmpty || pkgName == "root" then return
-    try
-      val pkgSym = requiredPackage(pkgName)
-      val pkgClass = pkgSym.moduleClass
-      if !pkgClass.exists then return
-      val layerObjectOpt = pkgClass.info.decls.iterator.find(s => s.name.toString == "layer")
-      layerObjectOpt match
-        case None =>
-        case Some(layerObjSym) =>
-          val allowed = extractDependsOnFromSymbol(layerObjSym)
-          packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
-          if !packageToHashHex.contains(pkgName) then packageToHashHex(pkgName) = dependsOnHash(allowed)
-    catch case _: Exception => ()
+    val s = resolveLayerSymbol(pkgName)
+    val layerObjOpt = if s != null && s.exists then Some(s) else None
+    layerObjOpt match
+      case None => ()
+      case Some(layerObjSym) =>
+        val allowed = extractDependsOnFromSymbol(layerObjSym)
+        packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
+        if !packageToHashHex.contains(pkgName) then packageToHashHex(pkgName) = dependsOnHash(allowed)
 
   /** Fallback: traverse tree and for each symbol that is the layer object, collect annotations. */
   private def collectDependsOnFromSymbols(tree: Tree, sourceContent: Option[String] = None)(using Context): Unit =
@@ -174,6 +187,30 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
   /** Whether the owner is the layer object's module class. */
   private def isLayerObject(owner: Symbol)(using Context): Boolean =
     owner.is(Flags.ModuleClass) && owner.sourceModule.exists && owner.sourceModule.name.toString == "layer"
+
+  /** Resolve the layer object for a package. Tries classpath first (requiredModule) so we find layers
+    * compiled in a previous run, then falls back to package decls.
+    */
+  private def resolveLayerSymbol(pkgName: String)(using Context): Symbol | Null =
+    def tryClasspath: Symbol | Null =
+      try
+        val lm = requiredModule(s"$pkgName.layer")
+        if lm.exists then lm else null
+      catch case _: Exception => null
+    def tryFromPackage: Symbol | Null =
+      try
+        val pkgSym = requiredPackage(pkgName)
+        val pkgClass = pkgSym.moduleClass
+        if !pkgClass.exists then null
+        else
+          pkgClass.denot.ensureCompleted()
+          pkgClass.info.decls.iterator.find(s => s.name.toString == "layer") match
+            case Some(s) => s
+            case None    => null
+      catch case _: Exception => null
+    tryClasspath match
+      case s: Symbol if s != null => s
+      case _ => tryFromPackage
 
 
   /** Extract string constants from annotation args. Handles varargs (String*) which appear as Typed(SeqLiteral(...), <repeated>). */
@@ -258,27 +295,27 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
           hashSym.entered
           val hashValDef = ValDef(hashSym, Literal(Constant(1)))
           List(hashValDef)
-        else if !isLayerObject(owner) && hashHexOpt.isDefined then
+        else if !isLayerObject(owner) then
           try
-            val pkgSym = requiredPackage(ownerPkg)
-            val layerObjSym = pkgSym.moduleClass.info.decls.iterator.find(s => s.name.toString == "layer").orNull
+            val layerObjSym = resolveLayerSymbol(ownerPkg)
             if layerObjSym != null then
+              layerObjSym.denot.ensureCompleted()
+              val layerType = if layerObjSym.info.exists then layerObjSym.info else defn.AnyType
               val layerRef = ref(layerObjSym)
-              // Reference the layer object itself (not hash_xxx) to avoid ordering: the layer's template
-              // may not be processed yet when we add this. When @dependsOn changes, the layer's bytecode
-              // changes (hash field added), so Zinc invalidates dependents.
-              // Private so it doesn't leak into public API; Lazy so Constructors phase retains it
-              // (non-lazy private vals with no uses get dropped, causing assertion failures in traits).
+              // Reference the layer object so Zinc invalidates this class when layer changes (@dependsOn).
+              // Fetched from classpath when layer.scala was not compiled in this run.
               val layerRefSym =
-                newSymbol(owner, termName("_layerRef"), Flags.Synthetic | Flags.Private | Flags.Lazy, layerObjSym.info).asTerm
+                newSymbol(owner, termName("_layerRef"), Flags.Synthetic | Flags.Private | Flags.Lazy, layerType).asTerm
               layerRefSym.entered
               val ownLayerRefs = List(ValDef(layerRefSym, layerRef))
-              // Add refs to dependent packages' layer objects so Zinc invalidates this class when any
-              // of those layers change (e.g. @dependsOn). Without these, incremental compilation can
-              // use stale layer config and report false errors.
               val dependentLayerRefs = collectDependentLayerRefs(owner, tree)
               ownLayerRefs ++ dependentLayerRefs
-            else Nil
+            else
+              // No layer object: use special hash instead of _layerRef. Zinc semantics for "no layers".
+              val hashSym =
+                newSymbol(owner, termName(s"hash_$noLayersHash"), Flags.Synthetic, defn.IntType).asTerm
+              hashSym.entered
+              List(ValDef(hashSym, Literal(Constant(1))))
           catch case _: Exception => Nil
         else Nil
       if additions.nonEmpty then
@@ -367,13 +404,14 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     val buf = List.newBuilder[ValDef]
     for refPkg <- refPkgs.toVector.sorted do
       try
-        val pkgSym = requiredPackage(refPkg)
-        val layerObjSym = pkgSym.moduleClass.info.decls.iterator.find(s => s.name.toString == "layer").orNull
+        val layerObjSym = resolveLayerSymbol(refPkg)
         if layerObjSym != null then
+          layerObjSym.denot.ensureCompleted()
+          val layerType = if layerObjSym.info.exists then layerObjSym.info else defn.AnyType
           val layerRef = ref(layerObjSym)
           val safeName = refPkg.replace(".", "_")
           val layerRefSym =
-            newSymbol(owner, termName(s"_layerRef_$safeName"), Flags.Synthetic | Flags.Private | Flags.Lazy, layerObjSym.info).asTerm
+            newSymbol(owner, termName(s"_layerRef_$safeName"), Flags.Synthetic | Flags.Private | Flags.Lazy, layerType).asTerm
           layerRefSym.entered
           buf += ValDef(layerRefSym, layerRef)
       catch case _: Exception => ()
