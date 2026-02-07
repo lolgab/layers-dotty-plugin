@@ -55,12 +55,6 @@ object layers extends ScalaModule with Publish {
           s"-Dlayers.jar=${layers.jar().path}"
         )
       }
-
-      // Exclude LayersConfigTests until LayersConfig is implemented
-      override def allSourceFiles = Task {
-        super.allSourceFiles().filter(!_.path.toString.contains("LayersConfigTests"))
-      }
-
     }
 
     def assembly = Task {

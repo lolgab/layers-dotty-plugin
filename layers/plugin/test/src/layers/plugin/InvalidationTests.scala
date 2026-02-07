@@ -2,10 +2,6 @@ package layers.plugin
 
 import munit.FunSuite
 
-import java.nio.file
-import java.nio.file.Files
-import scala.jdk.CollectionConverters.*
-
 /** Tests for Zinc incremental compilation behavior.
   *
   * The plugin validates layer dependencies at compile time. Zinc recompilation when @dependsOn
@@ -123,17 +119,3 @@ object layer
       s"Should get error for application (removed from @dependsOn). Output: ${round2.output}"
     )
   }
-
-  private def findServiceClass(root: file.Path): Option[file.Path] =
-    val candidates = Files.walk(root).iterator().asScala.filter { p =>
-      p.getFileName != null && p.getFileName.toString == "Service.class" &&
-        p.toString.contains("application")
-    }.toSeq
-    // Prefer classes/main (stable); bloop-internal-classes paths change between runs
-    candidates.find(_.toString.contains("classes/main")).orElse(candidates.headOption)
-
-  private def deleteRecursively(path: file.Path): Unit =
-    if Files.exists(path) then
-      if Files.isDirectory(path) then
-        Files.list(path).forEach(deleteRecursively)
-      Files.delete(path)

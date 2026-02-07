@@ -70,13 +70,18 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
           throw new IllegalStateException("maxLayers check requires at least one compilation unit with source")
         )
         report.error(
-          s"Application ${LayersConfig.maxLayersExceededMessage(layerCount, limit)} (e.g. -P:layers:maxLayers=$layerCount).",
+          s"Application ${maxLayersExceededMessage(layerCount, limit)} (e.g. -P:layers:maxLayers=$layerCount).",
           pos
         )
     }
     super.run
 
   private val dependsOnAnnotName = "dependsOn"
+
+  private def maxLayersExceededMessage(layerCount: Int, limit: Int): String =
+    val layersToRemove = layerCount - limit
+    val layerOrLayers = if layersToRemove == 1 then "layer" else "layers"
+    s"has $layerCount layers but maxLayers is $limit. Remove $layersToRemove $layerOrLayers or increase maxLayers."
 
   private def hasDependsOnAnnotation(sym: Symbol)(using Context): Boolean =
     if !sym.exists then false
