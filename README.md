@@ -64,6 +64,14 @@ object layer
 - **Subpackages**: A package can depend on its own subpackages
 - **Cycles**: The plugin detects and rejects cyclic file dependencies
 
+### Zinc incremental recompilation
+
+When you change the `@dependsOn` annotation on a layer object, Zinc (sbt/mill incremental compiler) must recompile all files in that package. The plugin ensures this by:
+
+1. Adding a synthetic `val hash_<hex> = 1` to each layer object, where the hash is derived from the `@dependsOn` content. When you change dependencies, the hash changes and the layer object is recompiled.
+2. Adding a synthetic `private val _layerRef = layer` to the first class/object in each package file (except the layer object file). This creates a dependency so Zinc recompiles those files when the layer object changes.
+3. Adding synthetic `private val _layerRef_<pkg> = <pkg>.layer` for each dependent package the class uses. This ensures Zinc recompiles when any of those layer objects change, avoiding stale layer config during incremental compilation.
+
 ## Example
 
 A typical layered structure:

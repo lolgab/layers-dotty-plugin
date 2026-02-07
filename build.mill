@@ -43,11 +43,17 @@ object layers extends ScalaModule with Publish {
       def moduleDeps = Seq(layers)
       def mvnDeps = Seq(
         mvn"org.scalameta::munit:1.1.0",
-        mvn"org.scala-lang::scala3-compiler:$crossScalaVersion"
+        mvn"org.scala-lang::scala3-compiler:$crossScalaVersion",
+        mvn"org.scala-sbt::zinc:2.0.0-M13",
+        mvn"org.scala-sbt:util-interface:2.0.0-RC8",
+        mvn"org.scala-lang:scala3-sbt-bridge:$crossScalaVersion"
       )
 
       def forkArgs = Task {
-        Seq(s"-Dlayers.plugin.jar=${outer.assembly().path}")
+        Seq(
+          s"-Dlayers.plugin.jar=${outer.assembly().path}",
+          s"-Dlayers.jar=${layers.jar().path}"
+        )
       }
 
       // Exclude LayersConfigTests until LayersConfig is implemented
