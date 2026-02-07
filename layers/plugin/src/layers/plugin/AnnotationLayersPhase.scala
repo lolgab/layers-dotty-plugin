@@ -15,8 +15,9 @@ import dotty.tools.dotc.transform.YCheckPositions
 
 /** Plugin phase that enforces package dependencies via @dependsOn annotations on the `layer` object.
   * By default nothing is allowed; packages must declare their dependencies explicitly.
+  * @dependsOn may only be placed on `object layer`; it fails on classes, traits, or objects with other names.
   */
-class AnnotationLayersPhase(using Context) extends PluginPhase:
+class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends PluginPhase:
   import tpd.*
 
   val phaseName = "layers"
@@ -28,13 +29,76 @@ class AnnotationLayersPhase(using Context) extends PluginPhase:
   /** Package -> allowed package prefixes, from @dependsOn annotations on the `layer` object */
   private val packageToAllowed = mutable.Map[String, Set[String]]()
 
+  private val maxLayers: Option[Int] =
+    options.collectFirst { case s if s.startsWith("maxLayers=") => s.drop(10).trim.toIntOption }.flatten.filter(_ > 0)
+
   override def run(using ctx: Context): Unit =
     val units = ctx.run.nn.units
     for unit <- units do
       if !unit.tpdTree.isEmpty then
+        validateDependsOnPlacement(unit.tpdTree)
         collectDependsOnFromTree(unit.tpdTree)
         collectDependsOnFromSymbols(unit.tpdTree)
+    maxLayers.foreach { limit =>
+      val layerCount = packageToAllowed.size
+      if layerCount > limit then
+        val pos = units.iterator.flatMap(u => if u.tpdTree.isEmpty then None else Some(u.tpdTree.srcPos)).nextOption().getOrElse(
+          throw new IllegalStateException("maxLayers check requires at least one compilation unit with source")
+        )
+        report.error(
+          s"Application ${LayersConfig.maxLayersExceededMessage(layerCount, limit)} (e.g. -P:layers:maxLayers=$layerCount).",
+          pos
+        )
+    }
     super.run
+
+  private val dependsOnAnnotName = "dependsOn"
+
+  private def hasDependsOnAnnotation(sym: Symbol)(using Context): Boolean =
+    if !sym.exists then false
+    else if sym.is(Flags.ModuleVal) then
+      val cls = sym.moduleClass
+      cls.exists && cls.annotations.exists(a => a.symbol.fullName.toString.endsWith(dependsOnAnnotName))
+    else if sym.isClass then
+      sym.asClass.annotations.exists(a => a.symbol.fullName.toString.endsWith(dependsOnAnnotName))
+    else false
+
+  private def isValidDependsOnPlacement(sym: Symbol): Boolean =
+    (sym.name.toString == "layer" && sym.is(Flags.ModuleVal)) ||
+    (sym.is(Flags.ModuleClass) && sym.sourceModule.exists && sym.sourceModule.name.toString == "layer")
+
+  /** Validates that @dependsOn appears only on `object layer`. Fails on classes, traits, or objects with other names. */
+  private def validateDependsOnPlacement(tree: Tree)(using Context): Unit =
+    tree match
+      case PackageDef(pid, stats) =>
+        for stat <- stats do validateStat(stat)
+      case _ =>
+        ()
+
+  private def validateStat(stat: Tree)(using Context): Unit =
+    stat match
+      case t: TypeDef =>
+        val sym = stat.symbol
+        if sym.exists && hasDependsOnAnnotation(sym) && !isValidDependsOnPlacement(sym) then
+          val kind = if sym.is(Flags.ModuleClass) then "object" else if sym.is(Flags.Trait) then "trait" else "class"
+          val name = if sym.is(Flags.ModuleClass) && sym.sourceModule.exists then sym.sourceModule.name.toString else sym.name.toString
+          report.error(
+            s"@dependsOn may only be placed on `object layer`. Found on $kind `$name`.",
+            stat.srcPos
+          )
+        // Optionally validate nested classes/objects (skipped: LazyTreeList complexity)
+      case v: ValDef if v.symbol.exists && v.symbol.is(Flags.ModuleVal) =>
+        val sym = v.symbol
+        if hasDependsOnAnnotation(sym) && !isValidDependsOnPlacement(sym) then
+          report.error(
+            s"@dependsOn may only be placed on `object layer`. Found on object `${sym.name}`.",
+            stat.srcPos
+          )
+      case PackageDef(pid, stats) =>
+        for s <- stats do validateStat(s)
+      case _ =>
+        ()
+
 
   private def collectDependsOnFromTree(tree: Tree)(using Context): Unit =
     tree match
@@ -47,8 +111,7 @@ class AnnotationLayersPhase(using Context) extends PluginPhase:
               (sym.is(Flags.ModuleClass) && sym.sourceModule.exists && sym.sourceModule.name.toString == "layer")
             if isLayerObject then
               val allowed = extractDependsOnFromSymbol(if sym.is(Flags.ModuleVal) then sym else sym.sourceModule)
-              if allowed.nonEmpty then
-                packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
+              packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
         collectDependsOnFromPackageSymbol(pkgName)
         for stat <- stats do collectDependsOnFromTree(stat)
       case _ =>
@@ -71,8 +134,7 @@ class AnnotationLayersPhase(using Context) extends PluginPhase:
         case None =>
         case Some(layerObjSym) =>
           val allowed = extractDependsOnFromSymbol(layerObjSym)
-          if allowed.nonEmpty then
-            packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
+          packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
     catch case _: Exception => ()
 
   /** Fallback: traverse tree and for each symbol that is the layer object, collect annotations. */
@@ -84,8 +146,7 @@ class AnnotationLayersPhase(using Context) extends PluginPhase:
           val pkgName = packageOf(sym.owner)
           if pkgName.nonEmpty then
             val allowed = extractDependsOnFromSymbol(t.symbol)
-            if allowed.nonEmpty then
-              packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
+            packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
     }
 
 

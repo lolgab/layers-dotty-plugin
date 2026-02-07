@@ -51,8 +51,13 @@ package infrastructure
 object layer
 ```
 
+### Options
+
+- **maxLayers**: Limit the maximum number of layers allowed (e.g. `-P:layers:maxLayers=5`). Compilation fails if the application has more layers than the limit.
+
 ### Rules
 
+- **@dependsOn placement**: The annotation may only be placed on `object layer`. It fails if placed on a class, trait, or an object with a different name.
 - **Default**: No cross-package dependencies are allowed
 - **Stdlib**: `scala.*` and `java.*` packages are always allowed
 - **Same package**: Types within the same package are always allowed

@@ -177,6 +177,31 @@ class LayersConfigTests extends FunSuite:
     assertEquals(config.layers, List("domain", "application", "infrastructure"))
   }
 
+  test("parse maxLayers from inline option") {
+    val config = LayersConfig.parseOrThrow(List("config=layers-allowed.conf", "maxLayers=5"))
+    assertEquals(config.maxLayers, Some(5))
+  }
+
+  test("parse maxLayers from config file") {
+    val tempFile = java.nio.file.Files.createTempFile("layers-maxlayers-", ".conf")
+    try
+      java.nio.file.Files.writeString(tempFile, "maxLayers: 3\ndomain\napplication\ninfrastructure")
+      val config = LayersConfig.parseOrThrow(List(s"config=${tempFile.toAbsolutePath}"))
+      assertEquals(config.maxLayers, Some(3))
+      assertEquals(config.layers, List("domain", "application", "infrastructure"))
+    finally java.nio.file.Files.deleteIfExists(tempFile)
+  }
+
+  test("parse fails when layers exceed maxLayers") {
+    val tempFile = java.nio.file.Files.createTempFile("layers-maxlayers-", ".conf")
+    try
+      java.nio.file.Files.writeString(tempFile, "maxLayers: 2\ndomain\napplication\ninfrastructure")
+      val result = LayersConfig.parse(List(s"config=${tempFile.toAbsolutePath}"))
+      assert(result.isLeft)
+      assert(result.fold(_.contains("maxLayers"), _ => false))
+    finally java.nio.file.Files.deleteIfExists(tempFile)
+  }
+
   test("parse parallel layers from config file") {
     val config = LayersConfig.parseOrThrow(List("config=layers-parallel.conf"))
     assertEquals(config.layers, List("domain", "db", "views", "controller"))

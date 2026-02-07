@@ -10,6 +10,7 @@ package layers.plugin
   * Allowed imports: -P:layers:allowed=domain:scala.;domain:java.
   * Strict mode: -P:layers:strict=true or strict: true in config. When enabled, outer layers may only depend on direct inner neighbors.
   * Max fan-out: -P:layers:maxFanOut=10 or maxFanOut: 10 in config. Limits distinct packages per file (stdlib excluded).
+  * Max layers: -P:layers:maxLayers=5 or maxLayers: 5 in config. Limits the maximum number of layers allowed in the application.
   * Domain purity: -P:layers:domainPurity=true or domainPurity: true in config. When enabled, domain layer cannot use effect types (Future, IO, Task) or framework annotations (javax.*, jakarta.*, org.springframework.*, etc.).
   * Naming conventions: conventions.ports and conventions.adapters in config. When specified, warns when traits in domain/application don't match port suffixes, or classes in outermost layer don't match adapter suffixes.
   * Dependency inversion: dependencyInversionWarning=true or -P:layers:dependencyInversionWarning=true. When enabled, warns when an outer layer references a concrete class from an inner layer (prefer depending on a trait/interface instead).
@@ -25,6 +26,7 @@ case class LayersConfig(
   allowedByLayer: Map[Int, List[String]] = Map.empty,
   strict: Boolean = false,
   maxFanOut: Option[Int] = None,
+  maxLayers: Option[Int] = None,
   domainPurity: Boolean = false,
   portSuffixes: List[String] = Nil,
   adapterSuffixes: List[String] = Nil,
@@ -158,6 +160,12 @@ case class LayersConfig(
         }
 
 object LayersConfig:
+  /** Error message when layer count exceeds maxLayers limit. */
+  def maxLayersExceededMessage(layerCount: Int, limit: Int): String =
+    val layersToRemove = layerCount - limit
+    val layerOrLayers = if layersToRemove == 1 then "layer" else "layers"
+    s"has $layerCount layers but maxLayers is $limit. Remove $layersToRemove $layerOrLayers or increase maxLayers."
+
   /** Returns Right(config) on success, Left(errorMessage) on failure. */
   def parse(options: List[String]): Either[String, LayersConfig] =
     parseEither(options)
@@ -172,6 +180,7 @@ object LayersConfig:
     val strictFromOptions = options.collectFirst { case s if s.startsWith("strict=") => s.drop(7).toLowerCase == "true" }
 
     val maxFanOutFromOptions = options.collectFirst { case s if s.startsWith("maxFanOut=") => s.drop(10).trim.toIntOption }.flatten.filter(_ > 0)
+    val maxLayersFromOptions = options.collectFirst { case s if s.startsWith("maxLayers=") => s.drop(10).trim.toIntOption }.flatten.filter(_ > 0)
     val domainPurityFromOptions = options.collectFirst { case s if s.startsWith("domainPurity=") => s.drop(12).toLowerCase == "true" }
     val dependencyInversionWarningFromOptions = options.collectFirst { case s if s.startsWith("dependencyInversionWarning=") => s.drop(27).toLowerCase == "true" }
 
@@ -191,8 +200,8 @@ object LayersConfig:
     if parsed.layers.isEmpty then
       return Left(s"layers plugin: config file $configPathRequired has no layers defined")
 
-    val (layers, allowedFromConfig, strictFromConfig, maxFanOutFromConfig, domainPurityFromConfig, portSuffixesFromConfig, adapterSuffixesFromConfig, slicesFromConfig, crossSliceFromConfig, parallelGroupsFromConfig, dependencyInversionWarningFromConfig) =
-      (parsed.layers, parsed.allowedByLayerName, parsed.strict, parsed.maxFanOut, parsed.domainPurity, parsed.portSuffixes, parsed.adapterSuffixes, parsed.slices, parsed.crossSliceAllowed, parsed.parallelGroups, parsed.dependencyInversionWarning)
+    val (layers, allowedFromConfig, strictFromConfig, maxFanOutFromConfig, maxLayersFromConfig, domainPurityFromConfig, portSuffixesFromConfig, adapterSuffixesFromConfig, slicesFromConfig, crossSliceFromConfig, parallelGroupsFromConfig, dependencyInversionWarningFromConfig) =
+      (parsed.layers, parsed.allowedByLayerName, parsed.strict, parsed.maxFanOut, parsed.maxLayers, parsed.domainPurity, parsed.portSuffixes, parsed.adapterSuffixes, parsed.slices, parsed.crossSliceAllowed, parsed.parallelGroups, parsed.dependencyInversionWarning)
 
     val strict = strictFromOptions.getOrElse(strictFromConfig)
 
@@ -208,14 +217,20 @@ object LayersConfig:
     }.toMap
 
     val maxFanOut = maxFanOutFromOptions.orElse(maxFanOutFromConfig)
+    val maxLayers = maxLayersFromOptions.orElse(maxLayersFromConfig)
     val domainPurity = domainPurityFromOptions.getOrElse(domainPurityFromConfig)
+
+    maxLayers.foreach { limit =>
+      if layers.size > limit then
+        return Left(s"layers plugin: application ${maxLayersExceededMessage(layers.size, limit)}")
+    }
     val portSuffixes = portSuffixesFromConfig
     val adapterSuffixes = adapterSuffixesFromConfig
     val slices = slicesFromConfig
     val crossSliceAllowed = crossSliceFromConfig
     val dependencyInversionWarning = dependencyInversionWarningFromOptions.getOrElse(dependencyInversionWarningFromConfig)
 
-    Right(LayersConfig(layers, packageToLayer, layerToTier, allowedByLayer, strict, maxFanOut, domainPurity, portSuffixes, adapterSuffixes, slices, crossSliceAllowed, dependencyInversionWarning))
+    Right(LayersConfig(layers, packageToLayer, layerToTier, allowedByLayer, strict, maxFanOut, maxLayers, domainPurity, portSuffixes, adapterSuffixes, slices, crossSliceAllowed, dependencyInversionWarning))
 
   /** Build layer name -> tier map. Layers in the same parallel group share a tier. */
   private def buildLayerToTier(layers: List[String], parallelGroups: List[Set[String]]): Map[String, Int] =
@@ -244,6 +259,7 @@ object LayersConfig:
       allowedByLayerName: Map[String, List[String]],
       strict: Boolean,
       maxFanOut: Option[Int] = None,
+      maxLayers: Option[Int] = None,
       domainPurity: Boolean = false,
       portSuffixes: List[String] = Nil,
       adapterSuffixes: List[String] = Nil,
@@ -292,66 +308,70 @@ object LayersConfig:
 
   private def parseConfigContent(content: String): ParsedConfig =
     val lines = content.linesIterator.toList
-    val (layers, allowedByLayerName, strict, maxFanOut, domainPurity, portSuffixes, adapterSuffixes, slices, crossSliceAllowed, parallelGroups, dependencyInversionWarning, _, _) = lines.foldLeft(
-      (List.empty[String], Map.empty[String, List[String]], false, Option.empty[Int], false, List.empty[String], List.empty[String], Map.empty[String, List[String]], Set.empty[(String, String)], List.empty[Set[String]], false, "", Option.empty[String])
+    val (layers, allowedByLayerName, strict, maxFanOut, maxLayers, domainPurity, portSuffixes, adapterSuffixes, slices, crossSliceAllowed, parallelGroups, dependencyInversionWarning, _, _) = lines.foldLeft(
+      (List.empty[String], Map.empty[String, List[String]], false, Option.empty[Int], Option.empty[Int], false, List.empty[String], List.empty[String], Map.empty[String, List[String]], Set.empty[(String, String)], List.empty[Set[String]], false, "", Option.empty[String])
     ) {
-      case ((accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer), rawLine) =>
+      case ((accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer), rawLine) =>
         val line = rawLine.trim
-        if line.isEmpty || line.startsWith("#") then (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+        if line.isEmpty || line.startsWith("#") then (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if (rawLine.startsWith(" ") || rawLine.startsWith("\t")) && line.startsWith("allowed:") then
           val prefixes = line.drop(8).split(",").map(_.trim).filter(_.nonEmpty).toList
           currentLayer match
             case Some(layer) =>
               val merged = accAllowed.getOrElse(layer, Nil) ++ prefixes
-              (accLayers, accAllowed + (layer -> merged), accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
-            case None => (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+              (accLayers, accAllowed + (layer -> merged), accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
+            case None => (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if (rawLine.startsWith(" ") || rawLine.startsWith("\t")) && section == "conventions" && line.startsWith("ports:") then
           val suffixes = line.drop(6).split(",").map(_.trim).filter(_.nonEmpty).toList
-          (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes ++ suffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+          (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes ++ suffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if (rawLine.startsWith(" ") || rawLine.startsWith("\t")) && section == "conventions" && line.startsWith("adapters:") then
           val suffixes = line.drop(9).split(",").map(_.trim).filter(_.nonEmpty).toList
-          (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes ++ suffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+          (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes ++ suffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if (rawLine.startsWith(" ") || rawLine.startsWith("\t")) && section == "slices" && line.contains(":") then
           val idx = line.indexOf(':')
           val sliceName = line.take(idx).trim
           val prefixes = line.drop(idx + 1).split(",").map(_.trim).filter(_.nonEmpty).toList
-          (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices + (sliceName -> prefixes), accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+          (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices + (sliceName -> prefixes), accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if (rawLine.startsWith(" ") || rawLine.startsWith("\t")) && section == "cross-slice" && line.contains("->") then
           val parts = line.split("->", 2).map(_.trim)
           if parts.length == 2 && parts(0).nonEmpty && parts(1).nonEmpty then
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice + ((parts(0), parts(1))), accParallel, accDepInvWarn, section, currentLayer)
-          else (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice + ((parts(0), parts(1))), accParallel, accDepInvWarn, section, currentLayer)
+          else (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if (rawLine.startsWith(" ") || rawLine.startsWith("\t")) && section == "parallel" then
           val layerNames = line.split(",").map(_.trim).filter(_.nonEmpty).toSet
           if layerNames.size >= 2 then
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel :+ layerNames, accDepInvWarn, section, currentLayer)
-          else (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel :+ layerNames, accDepInvWarn, section, currentLayer)
+          else (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
         else if !rawLine.startsWith(" ") && !rawLine.startsWith("\t") then
           val lower = line.toLowerCase
           if lower == "conventions" || lower.startsWith("conventions:") then
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "conventions", currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "conventions", currentLayer)
           else if lower == "slices" || lower.startsWith("slices:") then
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "slices", currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "slices", currentLayer)
           else if lower == "cross-slice" || lower.startsWith("cross-slice:") then
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "cross-slice", currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "cross-slice", currentLayer)
           else if lower == "parallel" || lower.startsWith("parallel:") then
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "parallel", currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "parallel", currentLayer)
           else if lower == "strict" || lower.startsWith("strict:") then
             val strictVal = lower == "strict" || line.drop(7).trim.toLowerCase == "true"
-            (accLayers, accAllowed, accStrict || strictVal, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
+            (accLayers, accAllowed, accStrict || strictVal, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
           else if lower.startsWith("maxfanout:") then
             val value = line.drop(10).trim
             val parsed = value.toIntOption.filter(_ > 0)
-            (accLayers, accAllowed, accStrict, parsed.orElse(accMaxFanOut), accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
+            (accLayers, accAllowed, accStrict, parsed.orElse(accMaxFanOut), accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
           else if lower == "domainpurity" || lower.startsWith("domainpurity:") then
             val purityVal = lower == "domainpurity" || line.drop(12).trim.toLowerCase == "true"
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity || purityVal, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity || purityVal, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
+          else if lower.startsWith("maxlayers:") then
+            val value = line.drop(10).trim
+            val parsed = value.toIntOption.filter(_ > 0)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, parsed.orElse(accMaxLayers), accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", currentLayer)
           else if lower == "dependencyinversionwarning" || lower.startsWith("dependencyinversionwarning:") then
             val warnVal = lower == "dependencyinversionwarning" || line.drop(27).trim.toLowerCase == "true"
-            (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn || warnVal, "", currentLayer)
+            (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn || warnVal, "", currentLayer)
           else
             val layer = line
-            (accLayers :+ layer, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", Some(layer))
-        else (accLayers, accAllowed, accStrict, accMaxFanOut, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
+            (accLayers :+ layer, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, "", Some(layer))
+        else (accLayers, accAllowed, accStrict, accMaxFanOut, accMaxLayers, accDomainPurity, accPortSuffixes, accAdapterSuffixes, accSlices, accCrossSlice, accParallel, accDepInvWarn, section, currentLayer)
     }
-    ParsedConfig(layers, allowedByLayerName, strict, maxFanOut, domainPurity, portSuffixes, adapterSuffixes, slices, crossSliceAllowed, parallelGroups, dependencyInversionWarning)
+    ParsedConfig(layers, allowedByLayerName, strict, maxFanOut, maxLayers, domainPurity, portSuffixes, adapterSuffixes, slices, crossSliceAllowed, parallelGroups, dependencyInversionWarning)

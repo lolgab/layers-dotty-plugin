@@ -87,3 +87,101 @@ class Service
     val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
     assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
   }
+
+  test("maxLayers limits number of layers - fails when exceeded") {
+    val sources = List(
+      "DomainLayer.scala" -> """package domain
+@layers.dependsOn()
+object layer
+""",
+      "ApplicationLayer.scala" -> """package application
+@layers.dependsOn("domain")
+object layer
+""",
+      "InfrastructureLayer.scala" -> """package infrastructure
+@layers.dependsOn("domain", "application")
+object layer
+""",
+      "DomainUser.scala" -> """package domain
+case class User(id: String)
+""",
+      "ApplicationService.scala" -> """package application
+class Service(u: domain.User)
+""",
+      "InfrastructureRepo.scala" -> """package infrastructure
+class Repo(u: domain.User, s: application.Service)
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath, "maxLayers=2")
+    assert(result.hasErrors, s"Expected compilation to fail with maxLayers=2 and 3 layers. Output: ${result.errorMessages}")
+    assert(
+      result.errorMessages.contains("maxLayers") && result.errorMessages.contains("3 layers"),
+      s"Expected maxLayers error message. Output: ${result.errorMessages}"
+    )
+  }
+
+  test("@dependsOn on class fails") {
+    val sources = List(
+      "Wrong.scala" -> """package app
+@layers.dependsOn("domain")
+class Foo
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
+    assert(result.hasErrors, s"Expected compilation to fail. Output: ${result.errorMessages}")
+    assert(
+      result.errorMessages.contains("@dependsOn may only be placed on `object layer`"),
+      s"Expected @dependsOn placement error. Output: ${result.errorMessages}"
+    )
+  }
+
+  test("@dependsOn on trait fails") {
+    val sources = List(
+      "Wrong.scala" -> """package app
+@layers.dependsOn("domain")
+trait Foo
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
+    assert(result.hasErrors, s"Expected compilation to fail. Output: ${result.errorMessages}")
+    assert(
+      result.errorMessages.contains("@dependsOn may only be placed on `object layer`"),
+      s"Expected @dependsOn placement error. Output: ${result.errorMessages}"
+    )
+  }
+
+  test("@dependsOn on object with wrong name fails") {
+    val sources = List(
+      "Wrong.scala" -> """package app
+@layers.dependsOn("domain")
+object config
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
+    assert(result.hasErrors, s"Expected compilation to fail. Output: ${result.errorMessages}")
+    assert(
+      result.errorMessages.contains("@dependsOn may only be placed on `object layer`"),
+      s"Expected @dependsOn placement error. Output: ${result.errorMessages}"
+    )
+  }
+
+  test("maxLayers allows compilation when within limit") {
+    val sources = List(
+      "DomainLayer.scala" -> """package domain
+@layers.dependsOn()
+object layer
+""",
+      "ApplicationLayer.scala" -> """package application
+@layers.dependsOn("domain")
+object layer
+""",
+      "DomainUser.scala" -> """package domain
+case class User(id: String)
+""",
+      "ApplicationService.scala" -> """package application
+class Service(u: domain.User)
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath, "maxLayers=3")
+    assert(!result.hasErrors, s"Expected compilation to succeed with maxLayers=3 and 2 layers. Errors: ${result.errorMessages}")
+  }
