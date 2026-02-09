@@ -9,6 +9,36 @@ class CycleDetectionTests extends FunSuite:
       sys.error("layers.plugin.jar system property not set. Tests must run with forkArgs from build.")
     )
 
+  test("cycle in layer dependencies reports compiler error with full path") {
+    val sources = List(
+      "AppLayer.scala" -> """package app
+@layers.dependsOn("app.auth")
+object layer
+""",
+      "AuthLayer.scala" -> """package app
+package auth
+
+@layers.dependsOn("app")
+object layer
+""",
+      "AuthService.scala" -> """package app
+package auth
+
+class AuthService
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
+    assert(result.hasErrors, s"Expected compilation to fail with cycle, but succeeded. Errors: ${result.errorMessages}")
+    assert(
+      result.errorMessages.contains("Cycle in layer dependencies") && result.errorMessages.contains(" → "),
+      s"Expected 'Cycle in layer dependencies' with cycle path (→) in output. Output: ${result.errorMessages}"
+    )
+    assert(
+      result.errorMessages.contains("app") && result.errorMessages.contains("app.auth"),
+      s"Expected cycle to show app and app.auth. Output: ${result.errorMessages}"
+    )
+  }
+
   test("cycle between files fails compilation") {
     val sources = List(
       "User.scala" -> """package core
@@ -194,4 +224,69 @@ class Service(u: domain.User)
     )
     val result = CompilerPluginTestHelper.compile(sources, pluginJarPath, "maxLayers=3")
     assert(!result.hasErrors, s"Expected compilation to succeed with maxLayers=3 and 2 layers. Errors: ${result.errorMessages}")
+  }
+
+  test("maxLayers with single package (depth 1) passes") {
+    val sources = List(
+      "Layer.scala" -> """package app
+@layers.dependsOn()
+object layer
+""",
+      "Service.scala" -> """package app
+class Service
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath, "maxLayers=1")
+    assert(!result.hasErrors, s"Expected compilation to succeed with maxLayers=1 and depth 1. Errors: ${result.errorMessages}")
+  }
+
+  test("maxLayers counts tree height (longest path), not total package count") {
+    // A -> B -> C and B -> D -> E: longest path is A -> B -> D -> E = 4 layers
+    // 5 packages but depth = 4
+    val sources = List(
+      "ALayer.scala" -> """package A
+@layers.dependsOn("B")
+object layer
+""",
+      "BLayer.scala" -> """package B
+@layers.dependsOn("C", "D")
+object layer
+""",
+      "CLayer.scala" -> """package C
+@layers.dependsOn()
+object layer
+""",
+      "DLayer.scala" -> """package D
+@layers.dependsOn("E")
+object layer
+""",
+      "ELayer.scala" -> """package E
+@layers.dependsOn()
+object layer
+""",
+      "AUser.scala" -> """package A
+class AUser(x: B.BUser)
+""",
+      "BUser.scala" -> """package B
+class BUser(x: C.CUser, y: D.DUser)
+""",
+      "CUser.scala" -> """package C
+class CUser
+""",
+      "DUser.scala" -> """package D
+class DUser(x: E.EUser)
+""",
+      "EUser.scala" -> """package E
+class EUser
+"""
+    )
+    val resultFail = CompilerPluginTestHelper.compile(sources, pluginJarPath, "maxLayers=3")
+    assert(resultFail.hasErrors, s"Expected compilation to fail with maxLayers=3 and depth 4. Output: ${resultFail.errorMessages}")
+    assert(
+      resultFail.errorMessages.contains("4 layers"),
+      s"Expected '4 layers' in error. Output: ${resultFail.errorMessages}"
+    )
+
+    val resultPass = CompilerPluginTestHelper.compile(sources, pluginJarPath, "maxLayers=4")
+    assert(!resultPass.hasErrors, s"Expected compilation to succeed with maxLayers=4. Errors: ${resultPass.errorMessages}")
   }

@@ -37,6 +37,9 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
   /** Package -> hash hex for Zinc invalidation. Hash derived from @dependsOn content. */
   private val packageToHashHex = mutable.Map[String, String]()
 
+  /** Package -> source position of the layer object (for error reporting). */
+  private val packageToLayerPos = mutable.Map[String, dotty.tools.dotc.util.SrcPos]()
+
   /** Special hash used when a package has no layer object. Ensures Zinc invalidation semantics. */
   private val noLayersHash = "nolayers"
 
@@ -63,8 +66,9 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     // is not in this run.
     for pkg <- packagesSeenInTree do
       if !packageToAllowed.contains(pkg) then collectDependsOnFromPackageSymbol(pkg)
-    maxLayers.foreach { limit =>
-      val layerCount = packageToAllowed.size
+    if !checkLayerCycles(units) then ()
+    else maxLayers.foreach { limit =>
+      val layerCount = computeLayerDepth()
       if layerCount > limit then
         val pos = units.iterator.flatMap(u => if u.tpdTree.isEmpty then None else Some(u.tpdTree.srcPos)).nextOption().getOrElse(
           throw new IllegalStateException("maxLayers check requires at least one compilation unit with source")
@@ -82,6 +86,81 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     val layersToRemove = layerCount - limit
     val layerOrLayers = if layersToRemove == 1 then "layer" else "layers"
     s"has $layerCount layers but maxLayers is $limit. Remove $layersToRemove $layerOrLayers or increase maxLayers."
+
+  /** Checks for cycles in layer dependencies. Reports a compiler error with the full cycle path if found.
+    * Returns false if a cycle was found (and reported), true otherwise.
+    */
+  private def checkLayerCycles(units: Iterable[dotty.tools.dotc.CompilationUnit])(using Context): Boolean =
+    findLayerCycle() match
+      case Some(cycle) =>
+        val cycleStr = cycle.mkString(" → ")
+        val pos = cycle.flatMap(p => packageToLayerPos.get(p)).headOption
+          .orElse(units.iterator.flatMap(u => if u.tpdTree.isEmpty then None else Some(u.tpdTree.srcPos)).nextOption())
+          .getOrElse(dotty.tools.dotc.util.NoSourcePosition)
+        report.error(
+          s"Cycle in layer dependencies: $cycleStr",
+          pos
+        )
+        false
+      case None => true
+
+  /** Returns the cycle path if a cycle exists (e.g. List("app", "app.auth", "app")), None otherwise. */
+  private def findLayerCycle(): Option[List[String]] =
+    val internalPackages = packageToAllowed.keySet.toSet
+    if internalPackages.isEmpty then return None
+
+    def internalDeps(pkg: String): Set[String] =
+      val allowed = packageToAllowed.getOrElse(pkg, Set.empty)
+      internalPackages.filter { q =>
+        q != pkg && allowed.exists(prefix => q == prefix || q.startsWith(prefix + "."))
+      }
+
+    val visited = mutable.Set[String]()
+    val path = mutable.ListBuffer[String]()
+    val pathSet = mutable.Set[String]()
+
+    def dfs(pkg: String): Option[List[String]] =
+      if pathSet(pkg) then
+        val idx = path.indexOf(pkg)
+        Some((path.drop(idx).toList :+ pkg))
+      else if visited(pkg) then
+        None
+      else
+        visited += pkg
+        path += pkg
+        pathSet += pkg
+        val result = internalDeps(pkg).iterator.flatMap(dfs).nextOption()
+        path.remove(path.length - 1)
+        pathSet -= pkg
+        result
+
+    internalPackages.iterator.flatMap(dfs).nextOption()
+
+  /** Number of layers = height of the dependency tree (longest path from root to leaf).
+    * Only counts packages with layer objects (internal packages); external deps are ignored.
+    * Call only when no cycle exists (after checkLayerCycles returns true).
+    */
+  private def computeLayerDepth(): Int =
+    val internalPackages = packageToAllowed.keySet.toSet
+    if internalPackages.isEmpty then return 0
+
+    def internalDeps(pkg: String): Set[String] =
+      val allowed = packageToAllowed.getOrElse(pkg, Set.empty)
+      internalPackages.filter { q =>
+        q != pkg && allowed.exists(prefix => q == prefix || q.startsWith(prefix + "."))
+      }
+
+    val depthCache = mutable.Map[String, Int]()
+    def depth(pkg: String, visited: Set[String]): Int =
+      if visited(pkg) then
+        throw new IllegalStateException(s"Cycle detected in layer dependencies involving $pkg")
+      depthCache.getOrElseUpdate(pkg, {
+        val deps = internalDeps(pkg)
+        if deps.isEmpty then 1
+        else 1 + deps.map(d => depth(d, visited + pkg)).max
+      })
+
+    internalPackages.map(p => depth(p, Set.empty)).max
 
   private def hasDependsOnAnnotation(sym: Symbol)(using Context): Boolean =
     if !sym.exists then false
@@ -143,6 +222,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
               val allowed = extractDependsOnFromSymbol(if sym.is(Flags.ModuleVal) then sym else sym.sourceModule)
               packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
               packageToHashHex(pkgName) = dependsOnHash(allowed, sourceContent)
+              packageToLayerPos(pkgName) = stat.srcPos
         for stat <- stats do collectDependsOnFromTree(stat, sourceContent)
       case _ =>
 
@@ -179,6 +259,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
             val allowed = extractDependsOnFromSymbol(t.symbol)
             packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
             if !packageToHashHex.contains(pkgName) then packageToHashHex(pkgName) = dependsOnHash(allowed, sourceContent)
+            if !packageToLayerPos.contains(pkgName) then packageToLayerPos(pkgName) = t.srcPos
     }
 
   /** Hash of @dependsOn content + source for Zinc invalidation. Changes when layer file or @dependsOn changes. */
@@ -306,7 +387,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
             if layerObjSym != null then
               layerObjSym.denot.ensureCompleted()
               val layerType = if layerObjSym.info.exists then layerObjSym.info else defn.AnyType
-              val layerRef = ref(layerObjSym)
+              val layerRef = layerRefRhs(layerObjSym, layerType)
               // Reference the layer object so Zinc invalidates this class when layer changes (@dependsOn).
               // Fetched from classpath when layer.scala was not compiled in this run.
               val layerRefSym =
@@ -413,7 +494,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
         if layerObjSym != null then
           layerObjSym.denot.ensureCompleted()
           val layerType = if layerObjSym.info.exists then layerObjSym.info else defn.AnyType
-          val layerRef = ref(layerObjSym)
+          val layerRef = layerRefRhs(layerObjSym, layerType)
           val safeName = refPkg.replace(".", "_")
           val layerRefSym =
             newSymbol(owner, termName(s"_layerRef_$safeName"), Flags.Synthetic | Flags.Private | Flags.Lazy, layerType).asTerm
@@ -430,6 +511,17 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
           buf += ((pkg, t.srcPos))
     }
     buf.result()
+
+  /** RHS for layer ref: null.asInstanceOf[layerType] creates the classpath dependency
+    * for Zinc without embedding a package-as-value tree. Using ref(layerObjSym) directly
+    * fails under Scala.js with "Cannot use package as value" when the qualifier is a
+    * package (e.g. app.layer).
+    */
+  private def layerRefRhs(layerObjSym: Symbol, layerType: Type)(using Context): Tree =
+    TypeApply(
+      Select(Literal(Constant(null)), defn.Any_asInstanceOf.name),
+      List(TypeTree(layerType))
+    )
 
   private def isStdLib(pkg: String): Boolean =
     pkg.startsWith("scala.") || pkg.startsWith("java.") || pkg == "scala" || pkg == "java"
