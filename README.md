@@ -53,7 +53,7 @@ object layer
 
 ### Options
 
-- **maxLayers**: Limit the maximum number of layers allowed (e.g. `-P:layers:maxLayers=5`). Compilation fails if the application has more layers than the limit.
+- **maxLayers**: Limit the maximum number of layers allowed (e.g. `-P:layers:maxLayers=5`). Compilation fails if the application has more layers than the limit. The layer count is the **height of the dependency tree** (longest path from root to leaf). Only packages with layer objects are counted; external dependencies (e.g. `scala.*`, `java.*`, third-party libraries) are ignored.
 
 ### Rules
 
