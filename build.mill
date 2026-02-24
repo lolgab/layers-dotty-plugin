@@ -1,11 +1,11 @@
-//| mill-version: 1.1.1
+//| mill-version: 1.1.2
 
 package build
 import mill.*, scalalib.*, publish.*
 import mill.javalib.SonatypeCentralPublishModule
 import mill.util.VcsVersionModule
 
-val scalaVersions = Seq("3.8.1")
+val scalaVersions = Seq("3.8.1", "3.8.2")
 
 trait Publish extends SonatypeCentralPublishModule with VcsVersionModule {
 
