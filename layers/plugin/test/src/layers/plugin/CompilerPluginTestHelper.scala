@@ -11,7 +11,12 @@ import java.nio.file.Files
   */
 object CompilerPluginTestHelper:
 
-  case class CompilationResult(hasErrors: Boolean, errorMessages: String, warningMessages: String = "")
+  case class CompilationResult(
+      hasErrors: Boolean,
+      errorMessages: String,
+      warningMessages: String = "",
+      outputDir: Option[java.nio.file.Path] = None
+  )
 
   /** Compile the given sources with the layers plugin.
     *
@@ -26,21 +31,25 @@ object CompilerPluginTestHelper:
   def compile(
       sources: List[(String, String)],
       pluginJarPath: String,
-      layersOptions: String | List[String] = Nil
+      layersOptions: String | List[String] = Nil,
+      outputDir: Option[java.nio.file.Path] = None
   ): CompilationResult =
     val opts = layersOptions match
       case s: String     => List(s)
       case l: List[?]    => l.asInstanceOf[List[String]]
-    compileWithOptions(sources, pluginJarPath, opts)
+    compileWithOptions(sources, pluginJarPath, opts, outputDir)
 
   private def compileWithOptions(
       sources: List[(String, String)],
       pluginJarPath: String,
-      layersOptions: List[String]
+      layersOptions: List[String],
+      outputDir: Option[java.nio.file.Path]
   ): CompilationResult =
-    val tempDir = Files.createTempDirectory("layers-plugin-test-")
+    val tempDir = outputDir.getOrElse(Files.createTempDirectory("layers-plugin-test-"))
+    val sourceDir = Files.createTempDirectory("layers-plugin-test-sources-")
     val filePaths = sources.map { case (name, content) =>
-      val path = tempDir.resolve(name)
+      val path = sourceDir.resolve(name)
+      Files.createDirectories(path.getParent)
       Files.writeString(path, content)
       path.toAbsolutePath.toString
     }
@@ -55,6 +64,8 @@ object CompilerPluginTestHelper:
         "-classpath",
         classpath,
         "-Xplugin:" + pluginJarPath,
+        "-d",
+        tempDir.toAbsolutePath.toString,
         "-deprecation"
       ) ++ pluginArgs ++ filePaths
       val reporter = new StoreReporter(null)
@@ -62,7 +73,12 @@ object CompilerPluginTestHelper:
       driver.process(args, reporter)
       val errorMessages = reporter.allErrors.map(_.message.toString).mkString("\n")
       val warningMessages = reporter.allWarnings.map(_.message.toString).mkString("\n")
-      CompilationResult(reporter.hasErrors, errorMessages, warningMessages)
+      CompilationResult(
+        reporter.hasErrors,
+        errorMessages,
+        warningMessages,
+        Some(tempDir)
+      )
     finally
       filePaths.foreach(p => Files.deleteIfExists(java.nio.file.Paths.get(p)))
-      Files.deleteIfExists(tempDir)
+      Files.deleteIfExists(sourceDir)

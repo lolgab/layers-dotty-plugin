@@ -55,6 +55,8 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     // During incremental compilation, package symbol lookup may return stale classpath symbols.
     for unit <- units do
       if !unit.tpdTree.isEmpty then
+        val unitFile = if unit.source != null then unit.source.file else null
+        registerJsNativeFromTree(unit.tpdTree, unitFile)
         validateDependsOnPlacement(unit.tpdTree)
         val sourceContent = if unit.source != null && unit.source.exists then
           Some(new String(unit.source.content()))
@@ -81,6 +83,98 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     super.run
 
   private val dependsOnAnnotName = "dependsOn"
+
+  /** Package -> simple names of @js.native types (trait/class/object share the companion name). */
+  private val jsNativeTypeNames = mutable.Map[String, mutable.Set[String]]()
+
+  /** Per-source file path, simple names of @js.native types declared in that file. */
+  private val jsNativeNamesByUnit = mutable.Map[String, mutable.Set[String]]()
+
+  /** Scala.js @js.native types may not have private members; skip plugin transforms for them. */
+  private def hasJsNativeAnnotation(sym: Symbol)(using Context): Boolean =
+    def hasNativeAnnots(s: Symbol): Boolean =
+      s.exists && s.annotations.exists { a =>
+        val name = a.symbol.fullName.toString
+        name == "scala.scalajs.js.native" || name.endsWith(".js.native")
+      }
+    def hosts(s: Symbol): List[Symbol] =
+      if !s.exists then Nil
+      else if s.is(Flags.ModuleVal) then List(s, s.moduleClass)
+      else if s.is(Flags.ModuleClass) then
+        if s.sourceModule.exists then List(s, s.sourceModule, s.sourceModule.moduleClass) else List(s)
+      else if s.isClass || s.is(Flags.Trait) then List(s.asClass)
+      else List(s)
+    if !sym.exists then false
+    else hosts(sym).exists(hasNativeAnnots)
+
+  private def registerJsNativeSymbol(sym: Symbol)(using Context): Unit =
+    if !sym.exists then return
+    val pkg = packageOf(sym)
+    if pkg.isEmpty || pkg == "root" then return
+    jsNativeTypeNames.getOrElseUpdate(pkg, mutable.Set()) += sym.name.toString
+
+  private def isJsNativeTypeName(owner: Symbol)(using Context): Boolean =
+    val pkg = packageOf(owner)
+    pkg.nonEmpty && pkg != "root" &&
+      jsNativeTypeNames.getOrElse(pkg, mutable.Set()).contains(owner.name.toString)
+
+  private def isJsNativeAnnotType(sym: Symbol): Boolean =
+    sym.exists && {
+      val name = sym.fullName.toString
+      name == "scala.scalajs.js.native" || name.endsWith(".js.native")
+    }
+
+  private def jsNativeAnnotTreeShape(annot: Tree): Boolean =
+    def isNativeName(name: Name): Boolean = name.toString == "native"
+    def loop(t: Tree): Boolean = t match
+      case Ident(name)        => isNativeName(name)
+      case Select(qual, name) => isNativeName(name) || loop(qual)
+      case New(tpt)           => loop(tpt)
+      case Apply(fn, _)       => loop(fn)
+      case Typed(inner, _)    => loop(inner)
+      case tpt: TypeTree      => tpt.tpe.typeSymbol.exists && isJsNativeAnnotType(tpt.tpe.typeSymbol)
+      case _                  => false
+    loop(annot)
+
+  private def jsNativeAnnotTypeSymbol(annot: Tree): Option[Symbol] =
+    if annot.symbol.exists then Some(annot.symbol)
+    else
+      def fromTpt(tpt: Tree): Option[Symbol] =
+        if tpt.tpe.typeSymbol.exists then Some(tpt.tpe.typeSymbol) else None
+      annot match
+        case Apply(Select(New(tpt), _), _) => fromTpt(tpt)
+        case Apply(New(tpt), _)            => fromTpt(tpt)
+        case New(tpt)                      => fromTpt(tpt)
+        case Typed(inner, _)               => jsNativeAnnotTypeSymbol(inner)
+        case _                             => None
+
+  private def isJsNativeAnnotTree(annot: Tree): Boolean =
+    jsNativeAnnotTypeSymbol(annot).exists(isJsNativeAnnotType) ||
+      jsNativeAnnotTreeShape(annot) ||
+      annot.toString.contains("scala.scalajs.js.native")
+
+  private def registerJsNativeFromTree(tree: Tree, unitFile: dotty.tools.io.AbstractFile | Null)(using Context): Unit =
+    tree.foreachSubTree:
+      case td: TypeDef if td.symbol.exists =>
+        val fromSymbol = hasJsNativeAnnotation(td.symbol)
+        val fromTree = td.mods.annotations.exists(isJsNativeAnnotTree)
+        if fromSymbol || fromTree then
+          registerJsNativeSymbol(td.symbol)
+          if unitFile != null then
+            jsNativeNamesByUnit.getOrElseUpdate(unitFile.path, mutable.Set()) += td.name.toString
+      case _ =>
+
+  private def isJsNativeInCurrentUnit(owner: Symbol)(using ctx: Context): Boolean =
+    val unit = ctx.compilationUnit
+    if unit == null || unit.source == null then false
+    else jsNativeNamesByUnit.get(unit.source.file.path).exists(_.contains(owner.name.toString))
+
+  private def isJsNative(sym: Symbol)(using Context): Boolean =
+    if !sym.exists then false
+    else if hasJsNativeAnnotation(sym) || isJsNativeTypeName(sym) || isJsNativeInCurrentUnit(sym) then true
+    else if sym.isClass || sym.is(Flags.Trait) then
+      sym.asClass.baseClasses.exists(hasJsNativeAnnotation)
+    else false
 
   private def maxLayersExceededMessage(layerCount: Int, limit: Int): String =
     val layersToRemove = layerCount - limit
@@ -344,9 +438,15 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
       val allowed = packageToAllowed.getOrElse(ownerPackage, Set.empty) + "scala" + "java"
       allowed.exists(prefix => refPackage == prefix || refPackage.startsWith(prefix + "."))
 
-  override def transformTypeDef(tree: TypeDef)(using Context): Tree =
+  override def transformTypeDef(tree: TypeDef)(using ctx: Context): Tree =
     val ownerSym = tree.symbol
-    if ownerSym.is(Flags.Synthetic) then return tree
+    val fromTree = tree.mods.annotations.exists(isJsNativeAnnotTree)
+    if ownerSym.exists && !ownerSym.is(Flags.Synthetic) && (hasJsNativeAnnotation(ownerSym) || fromTree) then
+      registerJsNativeSymbol(ownerSym)
+      val unit = ctx.compilationUnit
+      if unit != null && unit.source != null then
+        jsNativeNamesByUnit.getOrElseUpdate(unit.source.file.path, mutable.Set()) += ownerSym.name.toString
+    if ownerSym.is(Flags.Synthetic) || isJsNative(ownerSym) || fromTree then return tree
 
     val ownerPackage = packageOf(ownerSym)
 
@@ -364,9 +464,16 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
 
     tree
 
+  private def templateOwner(tree: Template)(using Context): Symbol =
+    val sym = tree.symbol
+    if sym.isClass then sym
+    else if sym.exists && sym.owner.isClass then sym.owner
+    else sym
+
   override def transformTemplate(tree: Template)(using Context): Tree =
-    val owner = tree.symbol.owner
-    if owner.exists && owner.isClass then
+    val owner = templateOwner(tree)
+    if owner.exists && (isJsNative(owner) || owner.is(Flags.Trait) || isJsNativeInCurrentUnit(owner) || isJsNativeTypeName(owner)) then return tree
+    if owner.exists && owner.isClass && !isJsNative(owner) then
       for paramList <- tree.constr.paramss; param <- paramList do
         param match
           case v: ValDef if v.tpt.tpe.exists =>
@@ -411,13 +518,17 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     else tree
 
   override def transformValDef(tree: ValDef)(using Context): Tree =
-    if tree.symbol.exists && tree.symbol.owner.exists && tree.symbol.owner.isClass && !tree.symbol.is(Flags.Synthetic) then
+    if tree.symbol.exists && tree.symbol.owner.exists &&
+       (tree.symbol.owner.isClass || tree.symbol.owner.is(Flags.Trait)) &&
+       !tree.symbol.is(Flags.Synthetic) && !isJsNative(tree.symbol.owner) then
       checkDependencies(tree.symbol.owner, tree.tpt.tpe, tree.srcPos)
     tree
 
   override def transformDefDef(tree: DefDef)(using Context): Tree =
     val isConstructor = tree.symbol.isConstructor
-    if tree.symbol.exists && tree.symbol.owner.exists && tree.symbol.owner.isClass &&
+    if tree.symbol.exists && tree.symbol.owner.exists &&
+       (tree.symbol.owner.isClass || tree.symbol.owner.is(Flags.Trait)) &&
+       !isJsNative(tree.symbol.owner) &&
        (isConstructor || !tree.symbol.isOneOf(Flags.Synthetic | Flags.Deferred)) then
       checkDependencies(tree.symbol.owner, tree.tpt.tpe, tree.srcPos)
       for paramList <- tree.paramss; param <- paramList do
