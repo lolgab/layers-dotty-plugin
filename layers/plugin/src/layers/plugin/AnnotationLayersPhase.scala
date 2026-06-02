@@ -18,9 +18,9 @@ import dotty.tools.dotc.plugins.PluginPhase
 import dotty.tools.dotc.report
 import dotty.tools.dotc.transform.YCheckPositions
 
-/** Plugin phase that enforces package dependencies via @dependsOn annotations on the `layer` object.
+/** Plugin phase that enforces package dependencies via @dependsOnPackages/@dependsOnLayers annotations on the `layer` object.
   * By default nothing is allowed; packages must declare their dependencies explicitly.
-  * @dependsOn may only be placed on `object layer`; it fails on classes, traits, or objects with other names.
+  * These annotations may only be placed on `object layer`; they fail on classes, traits, or objects with other names.
   */
 class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends PluginPhase:
   import tpd.*
@@ -31,10 +31,10 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
 
   private val fileDeps = mutable.Map[String, mutable.Set[String]]()
 
-  /** Package -> allowed package prefixes, from @dependsOn annotations on the `layer` object */
+  /** Package -> allowed package prefixes, from layer dependency annotations on the `layer` object */
   private val packageToAllowed = mutable.Map[String, Set[String]]()
 
-  /** Package -> hash hex for Zinc invalidation. Hash derived from @dependsOn content. */
+  /** Package -> hash hex for Zinc invalidation. Hash derived from layer dependency annotations content. */
   private val packageToHashHex = mutable.Map[String, String]()
 
   /** Package -> source position of the layer object (for error reporting). */
@@ -51,23 +51,23 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
 
   override def run(using ctx: Context): Unit =
     val units = ctx.run.nn.units
-    // Pass 1: collect @dependsOn from trees only. This uses fresh data from the current run.
+    // Pass 1: collect layer dependency annotations from trees only. This uses fresh data from the current run.
     // During incremental compilation, package symbol lookup may return stale classpath symbols.
     for unit <- units do
       if !unit.tpdTree.isEmpty then
         val unitFile = if unit.source != null then unit.source.file else null
         registerJsNativeFromTree(unit.tpdTree, unitFile)
-        validateDependsOnPlacement(unit.tpdTree)
+        validateLayerDependencyPlacement(unit.tpdTree)
         val sourceContent = if unit.source != null && unit.source.exists then
           Some(new String(unit.source.content()))
         else None
-        collectDependsOnFromTree(unit.tpdTree, sourceContent)
-        collectDependsOnFromSymbols(unit.tpdTree, sourceContent)
+        collectLayerDependenciesFromTree(unit.tpdTree, sourceContent)
+        collectLayerDependenciesFromSymbols(unit.tpdTree, sourceContent)
     // Pass 2: for packages we've seen but don't have layer info from trees, fall back to
     // package symbol (classpath). Handles e.g. compiling only Service.scala when layer.scala
     // is not in this run.
     for pkg <- packagesSeenInTree do
-      if !packageToAllowed.contains(pkg) then collectDependsOnFromPackageSymbol(pkg)
+      if !packageToAllowed.contains(pkg) then collectLayerDependenciesFromPackageSymbol(pkg)
     if !checkLayerCycles(units) then ()
     else maxLayers.foreach { limit =>
       val layerCount = computeLayerDepth()
@@ -82,7 +82,8 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     }
     super.run
 
-  private val dependsOnAnnotName = "dependsOn"
+  private val dependsOnPackagesAnnotName = "dependsOnPackages"
+  private val dependsOnLayersAnnotName = "dependsOnLayers"
 
   /** Package -> simple names of @js.native types (trait/class/object share the companion name). */
   private val jsNativeTypeNames = mutable.Map[String, mutable.Set[String]]()
@@ -256,21 +257,24 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
 
     internalPackages.map(p => depth(p, Set.empty)).max
 
-  private def hasDependsOnAnnotation(sym: Symbol)(using Context): Boolean =
+  private def isLayerDependencyAnnot(fullName: String): Boolean =
+    fullName.endsWith(dependsOnPackagesAnnotName) || fullName.endsWith(dependsOnLayersAnnotName)
+
+  private def hasLayerDependencyAnnotation(sym: Symbol)(using Context): Boolean =
     if !sym.exists then false
     else if sym.is(Flags.ModuleVal) then
       val cls = sym.moduleClass
-      cls.exists && cls.annotations.exists(a => a.symbol.fullName.toString.endsWith(dependsOnAnnotName))
+      cls.exists && cls.annotations.exists(a => isLayerDependencyAnnot(a.symbol.fullName.toString))
     else if sym.isClass then
-      sym.asClass.annotations.exists(a => a.symbol.fullName.toString.endsWith(dependsOnAnnotName))
+      sym.asClass.annotations.exists(a => isLayerDependencyAnnot(a.symbol.fullName.toString))
     else false
 
   private def isValidDependsOnPlacement(sym: Symbol): Boolean =
     (sym.name.toString == "layer" && sym.is(Flags.ModuleVal)) ||
     (sym.is(Flags.ModuleClass) && sym.sourceModule.exists && sym.sourceModule.name.toString == "layer")
 
-  /** Validates that @dependsOn appears only on `object layer`. Fails on classes, traits, or objects with other names. */
-  private def validateDependsOnPlacement(tree: Tree)(using Context): Unit =
+  /** Validates that layer dependency annotations appear only on `object layer`. */
+  private def validateLayerDependencyPlacement(tree: Tree)(using Context): Unit =
     tree match
       case PackageDef(pid, stats) =>
         for stat <- stats do validateStat(stat)
@@ -281,19 +285,19 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     stat match
       case t: TypeDef =>
         val sym = stat.symbol
-        if sym.exists && hasDependsOnAnnotation(sym) && !isValidDependsOnPlacement(sym) then
+        if sym.exists && hasLayerDependencyAnnotation(sym) && !isValidDependsOnPlacement(sym) then
           val kind = if sym.is(Flags.ModuleClass) then "object" else if sym.is(Flags.Trait) then "trait" else "class"
           val name = if sym.is(Flags.ModuleClass) && sym.sourceModule.exists then sym.sourceModule.name.toString else sym.name.toString
           report.error(
-            s"@dependsOn may only be placed on `object layer`. Found on $kind `$name`.",
+            s"@dependsOnPackages/@dependsOnLayers may only be placed on `object layer`. Found on $kind `$name`.",
             stat.srcPos
           )
         // Optionally validate nested classes/objects (skipped: LazyTreeList complexity)
       case v: ValDef if v.symbol.exists && v.symbol.is(Flags.ModuleVal) =>
         val sym = v.symbol
-        if hasDependsOnAnnotation(sym) && !isValidDependsOnPlacement(sym) then
+        if hasLayerDependencyAnnotation(sym) && !isValidDependsOnPlacement(sym) then
           report.error(
-            s"@dependsOn may only be placed on `object layer`. Found on object `${sym.name}`.",
+            s"@dependsOnPackages/@dependsOnLayers may only be placed on `object layer`. Found on object `${sym.name}`.",
             stat.srcPos
           )
       case PackageDef(pid, stats) =>
@@ -302,7 +306,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
         ()
 
 
-  private def collectDependsOnFromTree(tree: Tree, sourceContent: Option[String] = None)(using Context): Unit =
+  private def collectLayerDependenciesFromTree(tree: Tree, sourceContent: Option[String] = None)(using Context): Unit =
     tree match
       case PackageDef(pid, stats) =>
         val pkgName = packageNameFromTree(pid)
@@ -313,11 +317,11 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
             val isLayerObject = (sym.name.toString == "layer" && sym.is(Flags.ModuleVal)) ||
               (sym.is(Flags.ModuleClass) && sym.sourceModule.exists && sym.sourceModule.name.toString == "layer")
             if isLayerObject then
-              val allowed = extractDependsOnFromSymbol(if sym.is(Flags.ModuleVal) then sym else sym.sourceModule)
+              val allowed = extractAllowedPackagesFromSymbol(if sym.is(Flags.ModuleVal) then sym else sym.sourceModule)
               packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
               packageToHashHex(pkgName) = dependsOnHash(allowed, sourceContent)
               packageToLayerPos(pkgName) = stat.srcPos
-        for stat <- stats do collectDependsOnFromTree(stat, sourceContent)
+        for stat <- stats do collectLayerDependenciesFromTree(stat, sourceContent)
       case _ =>
 
   private def packageNameFromTree(tree: Tree)(using Context): String =
@@ -331,32 +335,32 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
     * Service.scala when layer.scala was compiled in a previous cycle). Fetch from classpath first
     * via requiredModule so we find layers not compiled in this run.
     */
-  private def collectDependsOnFromPackageSymbol(pkgName: String)(using Context): Unit =
+  private def collectLayerDependenciesFromPackageSymbol(pkgName: String)(using Context): Unit =
     if pkgName.isEmpty || pkgName == "root" then return
     val s = resolveLayerSymbol(pkgName)
     val layerObjOpt = if s != null && s.exists then Some(s) else None
     layerObjOpt match
       case None => ()
       case Some(layerObjSym) =>
-        val allowed = extractDependsOnFromSymbol(layerObjSym)
+        val allowed = extractAllowedPackagesFromSymbol(layerObjSym)
         packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
         if !packageToHashHex.contains(pkgName) then packageToHashHex(pkgName) = dependsOnHash(allowed)
 
   /** Fallback: traverse tree and for each symbol that is the layer object, collect annotations. */
-  private def collectDependsOnFromSymbols(tree: Tree, sourceContent: Option[String] = None)(using Context): Unit =
+  private def collectLayerDependenciesFromSymbols(tree: Tree, sourceContent: Option[String] = None)(using Context): Unit =
     tree.foreachSubTree { t =>
       if t.symbol.exists then
         val sym = t.symbol
         if sym.name.toString == "layer" && sym.is(Flags.ModuleVal) then
           val pkgName = packageOf(sym.owner)
           if pkgName.nonEmpty then
-            val allowed = extractDependsOnFromSymbol(t.symbol)
+            val allowed = extractAllowedPackagesFromSymbol(t.symbol)
             packageToAllowed(pkgName) = packageToAllowed.getOrElse(pkgName, Set.empty) ++ allowed
             if !packageToHashHex.contains(pkgName) then packageToHashHex(pkgName) = dependsOnHash(allowed, sourceContent)
             if !packageToLayerPos.contains(pkgName) then packageToLayerPos(pkgName) = t.srcPos
     }
 
-  /** Hash of @dependsOn content + source for Zinc invalidation. Changes when layer file or @dependsOn changes. */
+  /** Hash of layer dependency annotations content + source for Zinc invalidation. */
   private def dependsOnHash(allowed: Set[String], sourceContent: Option[String] = None): String =
     val depContent = if allowed.isEmpty then "" else allowed.toVector.sorted.mkString(",")
     val srcContent = sourceContent.getOrElse("")
@@ -419,15 +423,47 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
       case _ => None
     }.toSet
 
-  private def extractDependsOnFromSymbol(sym: Symbol)(using Context): Set[String] =
+  private def layerPackageFromSymbol(sym: Symbol)(using Context): Option[String] =
+    if !sym.exists then None
+    else if sym.is(Flags.ModuleVal) && sym.name.toString == "layer" then
+      val pkg = packageOf(sym.owner)
+      if pkg.nonEmpty && pkg != "root" then Some(pkg) else None
+    else if sym.is(Flags.ModuleClass) && sym.sourceModule.exists && sym.sourceModule.name.toString == "layer" then
+      val pkg = packageOf(sym.owner)
+      if pkg.nonEmpty && pkg != "root" then Some(pkg) else None
+    else None
+
+  private def extractLayerPackagesFromAnnotationArgs(args: List[Tree])(using Context): Set[String] =
+    def loop(arg: Tree): Set[String] = arg match
+      case SeqLiteral(elems, _) =>
+        elems.flatMap(loop).toSet
+      case Typed(SeqLiteral(elems, _), _) =>
+        elems.flatMap(loop).toSet
+      case Apply(fn, params) =>
+        loop(fn) ++ params.flatMap(loop).toSet
+      case TypeApply(fn, args) =>
+        loop(fn) ++ args.flatMap(loop).toSet
+      case NamedArg(_, value) =>
+        loop(value)
+      case Select(_, _) | Ident(_) =>
+        layerPackageFromSymbol(arg.symbol).toSet
+      case _ =>
+        Set.empty
+    args.flatMap(loop).toSet
+
+  private def extractAllowedPackagesFromSymbol(sym: Symbol)(using Context): Set[String] =
     val cls = if sym.is(Flags.ModuleVal) then sym.moduleClass else sym.asClass
     if !cls.exists then return Set.empty
     val annots = cls.annotations
-    val dependsOnAnnot = annots.find(a => a.symbol.fullName.toString.endsWith("dependsOn"))
-    dependsOnAnnot match
-      case None => Set.empty
-      case Some(annot) =>
-        extractStringsFromAnnotationArgs(annot.arguments)
+    val fromPackagesAnnot = annots
+      .find(a => a.symbol.fullName.toString.endsWith(dependsOnPackagesAnnotName))
+      .map(annot => extractStringsFromAnnotationArgs(annot.arguments))
+      .getOrElse(Set.empty)
+    val fromLayersAnnot = annots
+      .find(a => a.symbol.fullName.toString.endsWith(dependsOnLayersAnnotName))
+      .map(annot => extractLayerPackagesFromAnnotationArgs(annot.arguments))
+      .getOrElse(Set.empty)
+    fromPackagesAnnot ++ fromLayersAnnot
 
   private def isAllowed(ownerPackage: String, refPackage: String): Boolean =
     if refPackage.isEmpty || refPackage == "root" then true
@@ -458,7 +494,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
         if !isAllowed(ownerPackage, refPkg) then
           report.error(
             s"Package $ownerPackage cannot depend on $refPkg. " +
-              s"Add @dependsOn(\"$refPkg\") to the $ownerPackage layer object to allow this dependency.",
+              s"Add @dependsOnPackages(\"$refPkg\") or @dependsOnLayers(${refPkg}.layer) to the $ownerPackage layer object to allow this dependency.",
             pos
           )
 
@@ -495,7 +531,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
               layerObjSym.denot.ensureCompleted()
               val layerType = if layerObjSym.info.exists then layerObjSym.info else defn.AnyType
               val layerRef = layerRefRhs(layerObjSym, layerType)
-              // Reference the layer object so Zinc invalidates this class when layer changes (@dependsOn).
+              // Reference the layer object so Zinc invalidates this class when layer annotations change.
               // Fetched from classpath when layer.scala was not compiled in this run.
               val layerRefSym =
                 newSymbol(owner, termName("_layerRef"), Flags.Synthetic | Flags.Private | Flags.Lazy, layerType).asTerm
@@ -548,7 +584,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
       if !isStdLib(refPkg) && !isAllowed(ownerPkg, refPkg) then
         report.error(
           s"Package $ownerPkg cannot depend on $refPkg. " +
-            s"Add @dependsOn(\"$refPkg\") to the $ownerPkg layer object to allow this dependency.",
+            s"Add @dependsOnPackages(\"$refPkg\") or @dependsOnLayers(${refPkg}.layer) to the $ownerPkg layer object to allow this dependency.",
           pos
         )
 
@@ -559,7 +595,7 @@ class AnnotationLayersPhase(options: List[String] = Nil)(using Context) extends 
       if !isStdLib(refPkg) && !isAllowed(ownerPkg, refPkg) then
         report.error(
           s"Package $ownerPkg cannot depend on $refPkg. " +
-            s"Add @dependsOn(\"$refPkg\") to the $ownerPkg layer object to allow this dependency.",
+            s"Add @dependsOnPackages(\"$refPkg\") or @dependsOnLayers(${refPkg}.layer) to the $ownerPkg layer object to allow this dependency.",
           refPos
         )
 

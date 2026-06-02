@@ -12,13 +12,13 @@ class CycleDetectionTests extends FunSuite:
   test("cycle in layer dependencies reports compiler error with full path") {
     val sources = List(
       "AppLayer.scala" -> """package app
-@layers.dependsOn("app.auth")
+@layers.dependsOnPackages("app.auth")
 object layer
 """,
       "AuthLayer.scala" -> """package app
 package auth
 
-@layers.dependsOn("app")
+@layers.dependsOnPackages("app")
 object layer
 """,
       "AuthService.scala" -> """package app
@@ -71,7 +71,7 @@ trait BarRepo:
     assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
   }
 
-  test("package without @dependsOn cannot depend on another package") {
+  test("package without layer dependency annotations cannot depend on another package") {
     val sources = List(
       "User.scala" -> """package domain
 case class User(id: String)
@@ -88,13 +88,13 @@ class Service(u: domain.User)
     )
   }
 
-  test("@dependsOn in separate file is found and allows dependency") {
+  test("@dependsOnPackages in separate file is found and allows dependency") {
     val sources = List(
       "DomainUser.scala" -> """package domain
 case class User(id: String)
 """,
       "ApplicationLayer.scala" -> """package application
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object layer
 """,
       "ApplicationService.scala" -> """package application
@@ -105,7 +105,27 @@ class Service(u: domain.User)
     assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
   }
 
-  test("package with layer object (no @dependsOn) compiles") {
+  test("@dependsOnLayers reads package from referenced layer object") {
+    val sources = List(
+      "DomainUser.scala" -> """package domain
+case class User(id: String)
+""",
+      "DomainLayer.scala" -> """package domain
+object layer
+""",
+      "ApplicationLayer.scala" -> """package application
+@layers.dependsOnLayers(domain.layer)
+object layer
+""",
+      "ApplicationService.scala" -> """package application
+class Service(u: domain.User)
+"""
+    )
+    val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
+    assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
+  }
+
+  test("package with layer object (no dependency annotations) compiles") {
     val sources = List(
       "Layer.scala" -> """package app
 object layer
@@ -131,15 +151,15 @@ class Service(s: String)
   test("maxLayers limits number of layers - fails when exceeded") {
     val sources = List(
       "DomainLayer.scala" -> """package domain
-@layers.dependsOn()
+@layers.dependsOnPackages()
 object layer
 """,
       "ApplicationLayer.scala" -> """package application
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object layer
 """,
       "InfrastructureLayer.scala" -> """package infrastructure
-@layers.dependsOn("domain", "application")
+@layers.dependsOnPackages("domain", "application")
 object layer
 """,
       "DomainUser.scala" -> """package domain
@@ -160,59 +180,59 @@ class Repo(u: domain.User, s: application.Service)
     )
   }
 
-  test("@dependsOn on class fails") {
+  test("@dependsOnPackages on class fails") {
     val sources = List(
       "Wrong.scala" -> """package app
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 class Foo
 """
     )
     val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
     assert(result.hasErrors, s"Expected compilation to fail. Output: ${result.errorMessages}")
     assert(
-      result.errorMessages.contains("@dependsOn may only be placed on `object layer`"),
-      s"Expected @dependsOn placement error. Output: ${result.errorMessages}"
+      result.errorMessages.contains("@dependsOnPackages/@dependsOnLayers may only be placed on `object layer`"),
+      s"Expected layer dependency annotation placement error. Output: ${result.errorMessages}"
     )
   }
 
-  test("@dependsOn on trait fails") {
+  test("@dependsOnPackages on trait fails") {
     val sources = List(
       "Wrong.scala" -> """package app
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 trait Foo
 """
     )
     val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
     assert(result.hasErrors, s"Expected compilation to fail. Output: ${result.errorMessages}")
     assert(
-      result.errorMessages.contains("@dependsOn may only be placed on `object layer`"),
-      s"Expected @dependsOn placement error. Output: ${result.errorMessages}"
+      result.errorMessages.contains("@dependsOnPackages/@dependsOnLayers may only be placed on `object layer`"),
+      s"Expected layer dependency annotation placement error. Output: ${result.errorMessages}"
     )
   }
 
-  test("@dependsOn on object with wrong name fails") {
+  test("@dependsOnPackages on object with wrong name fails") {
     val sources = List(
       "Wrong.scala" -> """package app
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object config
 """
     )
     val result = CompilerPluginTestHelper.compile(sources, pluginJarPath)
     assert(result.hasErrors, s"Expected compilation to fail. Output: ${result.errorMessages}")
     assert(
-      result.errorMessages.contains("@dependsOn may only be placed on `object layer`"),
-      s"Expected @dependsOn placement error. Output: ${result.errorMessages}"
+      result.errorMessages.contains("@dependsOnPackages/@dependsOnLayers may only be placed on `object layer`"),
+      s"Expected layer dependency annotation placement error. Output: ${result.errorMessages}"
     )
   }
 
   test("maxLayers allows compilation when within limit") {
     val sources = List(
       "DomainLayer.scala" -> """package domain
-@layers.dependsOn()
+@layers.dependsOnPackages()
 object layer
 """,
       "ApplicationLayer.scala" -> """package application
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object layer
 """,
       "DomainUser.scala" -> """package domain
@@ -229,7 +249,7 @@ class Service(u: domain.User)
   test("maxLayers with single package (depth 1) passes") {
     val sources = List(
       "Layer.scala" -> """package app
-@layers.dependsOn()
+@layers.dependsOnPackages()
 object layer
 """,
       "Service.scala" -> """package app
@@ -245,23 +265,23 @@ class Service
     // 5 packages but depth = 4
     val sources = List(
       "ALayer.scala" -> """package A
-@layers.dependsOn("B")
+@layers.dependsOnPackages("B")
 object layer
 """,
       "BLayer.scala" -> """package B
-@layers.dependsOn("C", "D")
+@layers.dependsOnPackages("C", "D")
 object layer
 """,
       "CLayer.scala" -> """package C
-@layers.dependsOn()
+@layers.dependsOnPackages()
 object layer
 """,
       "DLayer.scala" -> """package D
-@layers.dependsOn("E")
+@layers.dependsOnPackages("E")
 object layer
 """,
       "ELayer.scala" -> """package E
-@layers.dependsOn()
+@layers.dependsOnPackages()
 object layer
 """,
       "AUser.scala" -> """package A
