@@ -1,4 +1,4 @@
 package application
 
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object layer

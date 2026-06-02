@@ -4,7 +4,7 @@ import munit.FunSuite
 
 /** Tests for Zinc incremental compilation behavior.
   *
-  * The plugin validates layer dependencies at compile time. Zinc recompilation when @dependsOn
+  * The plugin validates layer dependencies at compile time. Zinc recompilation when layer dependency annotations
   * changes depends on the build tool's dependency tracking.
   */
 class InvalidationTests extends FunSuite:
@@ -35,7 +35,7 @@ class InvalidationTests extends FunSuite:
   test("plugin compiles successfully with application layer") {
     val sources = List(
       "ApplicationLayer.scala" -> """package application
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object layer
 """,
       "ApplicationService.scala" -> """package application
@@ -49,7 +49,7 @@ case class User(id: String)
     assert(!result.hasErrors, s"Expected compilation to succeed. Errors: ${result.errorMessages}")
   }
 
-  test("incremental (Zinc): changing @dependsOn - no false positives for remaining layers") {
+  test("incremental (Zinc): changing @dependsOnPackages - no false positives for remaining layers") {
     val rounds = List(
       List(
         "domain/User.scala" -> """package domain
@@ -59,28 +59,28 @@ case class User(id: String)
 object layer
 """,
         "application/layer.scala" -> """package application
-@layers.dependsOn("domain")
+@layers.dependsOnPackages("domain")
 object layer
 """,
         "application/Service.scala" -> """package application
 class Service(u: domain.User)
 """,
         "infrastructure/layer.scala" -> """package infrastructure
-@layers.dependsOn("domain", "application")
+@layers.dependsOnPackages("domain", "application")
 object layer
 """,
         "infrastructure/Repo.scala" -> """package infrastructure
 class Repo(u: domain.User)
 """,
         "presentation/layer.scala" -> """package presentation
-@layers.dependsOn("infrastructure", "application")
+@layers.dependsOnPackages("infrastructure", "application")
 object layer
 """,
         "presentation/Cli.scala" -> """package presentation
 class Cli(s: application.Service, r: infrastructure.Repo)
 """,
         "main/layer.scala" -> """package main
-@layers.dependsOn("domain", "application", "infrastructure", "presentation")
+@layers.dependsOnPackages("domain", "application", "infrastructure", "presentation")
 object layer
 """,
         "main/Main.scala" -> """package main
@@ -93,7 +93,7 @@ object Main:
       ),
       List(
         "main/layer.scala" -> """package main
-@layers.dependsOn("domain", "infrastructure", "presentation")
+@layers.dependsOnPackages("domain", "infrastructure", "presentation")
 object layer
 """
       )
@@ -104,7 +104,7 @@ object layer
     val round2 = results(1)
     assert(
       round2.exitCode != 0,
-      s"Round 2 should fail (main uses application, removed from @dependsOn). exitCode=${round2.exitCode} output=${round2.output.take(2000)}"
+      s"Round 2 should fail (main uses application, removed from @dependsOnPackages). exitCode=${round2.exitCode} output=${round2.output.take(2000)}"
     )
     assert(
       !round2.output.contains("cannot depend on infrastructure"),
@@ -116,6 +116,6 @@ object layer
     )
     assert(
       round2.output.contains("cannot depend on application"),
-      s"Should get error for application (removed from @dependsOn). Output: ${round2.output}"
+      s"Should get error for application (removed from @dependsOnPackages). Output: ${round2.output}"
     )
   }
