@@ -66,6 +66,17 @@ object layer
 
 - **maxLayers**: Limit the maximum number of layers allowed (e.g. `-P:layers:maxLayers=5`). Compilation fails if the application has more layers than the limit. The layer count is the **height of the dependency tree** (longest path from root to leaf). Only packages with layer objects are counted; external dependencies (e.g. `scala.*`, `java.*`, third-party libraries) are ignored.
 
+- **design**: Also run checks inferred from the code, on top of the annotation checks (`-P:layers:design`). Annotations can add constraints but never allow what these checks reject. Checks:
+  - cyclic dependencies between packages, with the cheapest edges to cut
+  - Stable Dependencies Principle: a package may not depend on a less stable one (instability I = Ce / (Ca + Ce))
+  - method size and complexity: `maxCyclomatic=10`, `maxCognitive=15`, `maxMethodLines=60`, `maxParams=5` (explicit parameters), `maxNesting=4`
+  - slop: duplicated methods (same logic up to local names and literals, `minCloneSize=30` syntax nodes), pass-through methods that only forward to another class, and traits with a single implementation in the same package
+  - class cohesion: `maxLcom=2`, the most groups of methods that share no field and call no one another (LCOM4). More groups means the class mixes responsibilities
+
+  Errors list every reference site and fix options. Facts are cached under `META-INF/layers-facts` in the class output so incremental compilation still sees the whole project.
+- **baseline=<file>**: accepted legacy findings with the worst accepted value for each (use an absolute path under Mill). New findings, or findings worse than the baseline value, fail. Entries that improved or were fixed also fail until locked in, so improvements cannot regress. Create the file by compiling once with `-P:layers:updateBaseline`. Afterwards `updateBaseline` only lowers or removes entries; adding or raising one is a manual edit.
+- **metrics**: Print per-package Ca, Ce, instability, abstractness, distance from the main sequence and inferred layer.
+
 ### Rules
 
 - **`@dependsOnPackages`/`@dependsOnLayers` placement**: These annotations may only be placed on `object layer`. They fail if placed on a class, trait, or an object with a different name.
