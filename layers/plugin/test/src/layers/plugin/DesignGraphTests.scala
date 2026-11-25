@@ -309,24 +309,47 @@ class Calc:
     assert(!r.hasErrors, r.errorMessages)
   }
 
-  test("class with unrelated method groups is reported") {
+  private val animals =
+    """package p
+case class Cat(n: String)
+case class Dog(n: String)
+case class Cow(n: String)
+"""
+
+  test("class mixing methods that work on different domain types is reported") {
     val r = design(
-      """package p
-class Mixed:
-  private var users = 0
-  private var orders = 0
-  def addUser(): Unit = users += 1
-  def countUsers: Int = users
-  def addOrder(): Unit = orders += 1
-  def countOrders: Int = orders
+      animals + """
+class Zoo:
+  def addCat(c: Cat): Unit = ()
+  def cats: Seq[Cat] = Nil
+  def addDog(d: Dog): Unit = ()
+  def dogs: Seq[Dog] = Nil
+  def addCow(c: Cow): Unit = ()
+  def cows: Seq[Cow] = Nil
 """,
-      "maxLcom=1"
+      "maxResponsibilities=2"
     )
-    assert(r.errorMessages.contains("Class `p.Mixed` has 2 unrelated groups"), r.errorMessages)
-    assert(r.errorMessages.contains("addUser") && r.errorMessages.contains("addOrder"), r.errorMessages)
+    assert(r.errorMessages.contains("Class `p.Zoo` has 3 responsibilities"), r.errorMessages)
+    assert(r.errorMessages.contains("[Cat] addCat, cats") && r.errorMessages.contains("[Dog]"), r.errorMessages)
   }
 
-  test("methods that share a field or call each other are cohesive") {
+  test("objects are judged like classes, so moving methods into an object does not hide them") {
+    val r = design(
+      animals + """
+object Zoo:
+  def addCat(c: Cat): Unit = ()
+  def cats: Seq[Cat] = Nil
+  def addDog(d: Dog): Unit = ()
+  def dogs: Seq[Dog] = Nil
+  def addCow(c: Cow): Unit = ()
+  def cows: Seq[Cow] = Nil
+""",
+      "maxResponsibilities=2"
+    )
+    assert(r.errorMessages.contains("`p.Zoo` has 3 responsibilities"), r.errorMessages)
+  }
+
+  test("methods that share a field, a type or call each other are cohesive") {
     val r = design(
       """package p
 class Counter:
@@ -334,10 +357,292 @@ class Counter:
   def inc(): Unit = n += 1
   def twice(): Unit = { inc(); inc() }
   def get: Int = n
+  def reset(): Unit = n = 0
 """,
-      "maxLcom=1"
+      "maxResponsibilities=1"
     )
     assert(!r.hasErrors, r.errorMessages)
+  }
+
+  test("a shared concrete helper does not hide unrelated responsibilities") {
+    val r = design(
+      animals + """
+class Zoo:
+  private def tx[A](f: => A): A = f
+  def addCat(c: Cat): Unit = tx(())
+  def cats: Seq[Cat] = tx(Nil)
+  def addDog(d: Dog): Unit = tx(())
+  def dogs: Seq[Dog] = tx(Nil)
+  def addCow(c: Cow): Unit = tx(())
+  def cows: Seq[Cow] = tx(Nil)
+  def addHen(c: Cat): Unit = tx(())
+  def hens: Seq[Cow] = tx(Nil)
+""",
+      "maxResponsibilities=1"
+    )
+    assert(r.errorMessages.contains("Class `p.Zoo` has 3 responsibilities"), r.errorMessages)
+  }
+
+  test("default argument getters and export forwarders are not methods of the class") {
+    val r = design(
+      animals + """
+object Parts:
+  def a(c: Cat): Int = 1
+  def b(d: Dog): Int = 2
+  def c(c: Cow): Int = 3
+  def d(c: Cat, d: Dog): Int = 4
+class Zoo:
+  def withDefaults(x: Int = 1, y: Int = 2, z: Int = 3): Int = x + y + z
+  def withDefaults2(x: Int = 1, y: Int = 2): Int = x + y
+  def cats(c: Cat): Int = 1
+  def cats2(c: Cat): Int = 2
+""",
+      "maxResponsibilities=2"
+    )
+    assert(!r.hasErrors, r.errorMessages)
+  }
+
+  test("a class that is mostly exports is a facade") {
+    val r = design(
+      """package p
+object Parts:
+  def a: Int = 1
+  def b: Int = 2
+  def c: Int = 3
+  def d: Int = 4
+class Facade:
+  export Parts.*
+  def own: Int = 0
+  def mine: Int = 0
+""",
+      "maxExports=3"
+    )
+    assert(r.errorMessages.contains("Class `p.Facade` is mostly a facade"), r.errorMessages)
+  }
+
+  test("splitting a method into single-use private helpers does not hide its complexity") {
+    val branch = (1 to 4).map(i => s"    if x == $i then $i else").mkString("\n")
+    val r = design(
+      s"""package p
+class C:
+  def run(x: Int): Int = one(x) + two(x)
+  private def one(x: Int): Int =
+$branch
+    0
+  private def two(x: Int): Int =
+$branch
+    0
+""",
+      "maxCyclomatic=6", "maxClusterCyclomatic=1"
+    )
+    assert(r.errorMessages.contains("Method `p.C.run`") && r.errorMessages.contains("single-use helper"), r.errorMessages)
+    assert(!r.errorMessages.contains("Method `p.C.one`"), r.errorMessages)
+  }
+
+  test("making a single-use helper public does not hide its size") {
+    val body = (1 to 30).map(i => s"    val v$i = x + $i + x * $i + x - $i + x * 2").mkString("\n")
+    val r = design(
+      s"""package p
+object C:
+  def run(x: Int): Int = part(x)
+  def part(x: Int): Int =
+$body
+    v1
+""",
+      "maxMethodLines=10", "maxFlatLines=1"
+    )
+    // too big to be hidden: it is reported itself, wherever it lives and whatever its visibility
+    assert(r.errorMessages.contains("Method `p.C$.part` is too long"), r.errorMessages)
+  }
+
+  test("making single-use helpers public does not hide that their sum is too long") {
+    val body = (1 to 8).map(i => s"    val v$i = x + $i + x * $i + x - $i + x * 2").mkString("\n")
+    val r = design(
+      s"""package p
+object C:
+  def run(x: Int): Int = part(x) + other(x)
+  def part(x: Int): Int =
+$body
+    v1
+  def other(x: Int): Int =
+$body
+    v2
+""",
+      "maxMethodLines=10", "maxFlatLines=1", "maxClusterLines=1"
+    )
+    assert(r.errorMessages.contains("Method `p.C$.run`") && r.errorMessages.contains("single-use helper"), r.errorMessages)
+  }
+
+  test("method size ignores formatting: spreading the same code over more lines gives the same size") {
+    def value(body: String): Int =
+      val r = design(s"package p\nobject C:\n  def a(x: Int): Int =\n$body\n    x\n", "maxMethodLines=1", "maxFlatLines=1")
+      "(?s)too long.*?: (\\d+) \\(limit".r.findFirstMatchIn(r.errorMessages).map(_.group(1).toInt).getOrElse(-1)
+    val tight = (1 to 30).map(i => s"    val v$i = x + $i").mkString("\n")
+    val spread = (1 to 30).map(i => s"    val v$i =\n      x +\n        $i").mkString("\n")
+    assertEquals(value(spread), value(tight))
+    assert(value(tight) > 0)
+    // comments are not code
+    val comments = (1 to 80).map(i => s"    // note $i about nothing").mkString("\n")
+    assertEquals(value(comments + "\n" + tight), value(tight))
+  }
+
+  test("a val holding a table of lambdas is measured like a method body") {
+    val rows = (1 to 8).map(i => s"    (x: Int) => if x > $i then $i else if x < -$i then -$i else 0").mkString(",\n")
+    val r = design(
+      s"""package p
+object T:
+  val rules: List[Int => Int] = List(
+$rows
+  )
+""",
+      "maxCyclomatic=10"
+    )
+    assert(r.errorMessages.contains("`p.T$.rules`") && r.errorMessages.contains("independent paths"), r.errorMessages)
+  }
+
+  test("top-level definitions of a file are one object and are checked for cohesion too") {
+    val r = design(
+      """package p
+case class A(n: Int)
+case class B(n: Int)
+case class C(n: Int)
+def fa(a: A): Int = a.n
+def ga(a: A): Int = a.n + 1
+def fb(b: B): Int = b.n
+def gb(b: B): Int = b.n + 1
+def fc(c: C): Int = c.n
+def gc(c: C): Int = c.n + 1
+""",
+      "maxResponsibilities=2"
+    )
+    assert(r.errorMessages.contains("responsibilities (limit 2)"), r.errorMessages)
+  }
+
+  test("code pasted in by an inline method is not counted at the call site") {
+    val branch = (1 to 12).map(i => s"    if x == $i then $i else").mkString("\n")
+    val r = design(
+      s"""package p
+object Rules:
+  inline def classify(inline x: Int): Int =
+$branch
+    0
+object Use:
+  val a: Int = Rules.classify(3)
+  def b(): Int = Rules.classify(4)
+""",
+      "maxCyclomatic=6"
+    )
+    assert(!r.errorMessages.contains("Use$"), r.errorMessages)
+  }
+
+  test("long text and flat layout are not logic: prose weighs little, flat methods may run longer") {
+    val prose = (1 to 40).map(i => s"""    "paragraph $i: ${"lorem ipsum dolor sit amet " * 4}" +""").mkString("\n")
+    val r = design(s"package p\nobject T:\n  def text: String =\n$prose\n    \"\"\n", "maxMethodLines=20")
+    assert(!r.hasErrors, r.errorMessages)
+    val flat = (1 to 60).map(i => s"    val v$i = List(x, $i, x + $i, x * $i)").mkString("\n")
+    val flatR = design(s"package p\nobject T:\n  def f(x: Int): Int =\n$flat\n    x\n", "maxMethodLines=20", "maxFlatLines=400")
+    assert(!flatR.hasErrors, flatR.errorMessages)
+    val logic = (1 to 12).map(i => s"    val v$i = if x > $i then List(x, $i, x + $i) else List(x * $i, x - $i, $i)").mkString("\n")
+    val logicR = design(s"package p\nobject T:\n  def f(x: Int): Int =\n$logic\n    x\n", "maxMethodLines=20", "maxFlatLines=400")
+    assert(logicR.errorMessages.contains("is too long"), logicR.errorMessages)
+  }
+
+  test("a helper used from two methods is reuse, not fragmentation") {
+    val branch = (1 to 4).map(i => s"    if x == $i then $i else").mkString("\n")
+    val r = design(
+      s"""package p
+class C:
+  def a(x: Int): Int = help(x)
+  def b(x: Int): Int = help(x) + 1
+  private def help(x: Int): Int =
+$branch
+    0
+""",
+      "maxCyclomatic=6"
+    )
+    assert(!r.hasErrors, r.errorMessages)
+  }
+
+  test("a case class built once and read by one method is a parameter object in disguise") {
+    val r = design(
+      """package p
+case class Args(a: Int, b: Int, c: Int, d: Int)
+class Svc:
+  def run(): Int = work(Args(1, 2, 3, 4))
+  private def work(args: Args): Int = args.a + args.b + args.c + args.d
+""",
+      ""
+    )
+    assert(r.errorMessages.contains("`p.Args` is a single-use parameter object"), r.errorMessages)
+  }
+
+  test("a case class used in several places or with behaviour is a real type") {
+    val reused = design(
+      """package p
+case class Args(a: Int, b: Int, c: Int, d: Int)
+class Svc:
+  def run(): Int = work(Args(1, 2, 3, 4)) + other(Args(5, 6, 7, 8))
+  private def work(args: Args): Int = args.a + args.b + args.c + args.d
+  private def other(args: Args): Int = args.a
+""",
+      ""
+    )
+    assert(!reused.hasErrors, reused.errorMessages)
+    val behaving = design(
+      """package p
+case class Args(a: Int, b: Int, c: Int, d: Int):
+  def total: Int = a + b + c + d
+class Svc:
+  def run(): Int = work(Args(1, 2, 3, 4))
+  private def work(args: Args): Int = args.total
+""",
+      ""
+    )
+    assert(!behaving.hasErrors, behaving.errorMessages)
+  }
+
+  test("a wrapper that reorders parameters or adds one constant is still a pass-through") {
+    val r = design(
+      """package p
+class Repo:
+  def find(id: Long, name: String, mode: Int): String = name + id + mode
+class Service(repo: Repo):
+  def lookup(name: String, id: Long): String = repo.find(id, name, 0)
+""",
+      ""
+    )
+    assert(r.errorMessages.contains("only forwards"), r.errorMessages)
+  }
+
+  private def sh(dir: java.nio.file.Path, args: String*): Unit =
+    val p = new ProcessBuilder((List("git", "-C", dir.toString, "-c", "user.name=t", "-c", "user.email=t@t") ++ args)*)
+      .redirectErrorStream(true).start()
+    p.getInputStream.readAllBytes()
+    assertEquals(p.waitFor(), 0)
+
+  test("since=<rev> enforces limits only on code changed since that revision") {
+    val dir = java.nio.file.Files.createTempDirectory("layers-ratchet-")
+    def branchy(tag: String, n: Int) =
+      s"  def $tag(x: Int): Int =\n" + (1 to n).map(i => s"    if x == $i then $i else").mkString("\n") + "\n    0\n"
+    def src(oldBody: String) = "package p\nclass Old:\n" + oldBody + "class Other:\n" + branchy("untouched", 6)
+    def compile(files: List[(String, String)]) =
+      CompilerPluginTestHelper.compile(files, pluginJarPath, List("design", "maxCyclomatic=3", "since=HEAD"), sourceDir = Some(dir))
+    val layer = "Layer.scala" -> "package p\nobject layer\n"
+    compile(List(layer, "Src.scala" -> src(branchy("run", 6)))) // write the files
+    sh(dir, "init", "-q")
+    sh(dir, "add", ".")
+    sh(dir, "commit", "-q", "-m", "legacy")
+
+    val unchanged = compile(List(layer, "Src.scala" -> src(branchy("run", 6))))
+    assert(!unchanged.hasErrors, unchanged.errorMessages)
+    assert(unchanged.warningMessages.contains("existing findings"), unchanged.warningMessages)
+
+    val edited = compile(List(layer, "Src.scala" -> src(branchy("run", 7))))
+    assert(edited.hasErrors && edited.errorMessages.contains("p.Old.run"), edited.errorMessages)
+    assert(!edited.errorMessages.contains("untouched"), edited.errorMessages)
+
+    val added = compile(List(layer, "Src.scala" -> src(branchy("run", 6)), "New.scala" -> ("package p\nclass Fresh:\n" + branchy("go", 6))))
+    assert(added.hasErrors && added.errorMessages.contains("Method `p.Fresh.go`") && !added.errorMessages.contains("Method `p.Old.run`"), added.errorMessages)
   }
 
   test("member baseline: accepts worst value, rejects regression") {

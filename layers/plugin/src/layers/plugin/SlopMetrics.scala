@@ -46,8 +46,19 @@ object SlopMetrics:
     case Ident(_)        => t.symbol
     case _               => NoSymbol
 
-  /** A new (not overriding) method whose whole body hands its explicit parameters, unchanged and in order, to a method
-    * of another class. Overrides are skipped: delegating an interface method is how decorators and adapters work.
+  /** An argument that carries no logic of its own: a literal, a reference, or `summon`. Passing one extra of these
+    * does not make a wrapper do anything.
+    */
+  private def trivialArg(t: Tree)(using Context): Boolean = strip(t) match
+    case _: Literal | _: Ident | _: This => true
+    case Select(q, _)                    => trivialArg(q)
+    case Apply(fn, _) if fn.symbol.name.toString == "summon" && fn.symbol.owner == defn.ScalaPredefModuleClass => true
+    case TypeApply(fn, _) => trivialArg(fn)
+    case _                => false
+
+  /** A new (not overriding) method whose whole body hands every explicit parameter, each as is, to a method of another
+    * class, with at most one extra constant or reference. Reordering the parameters or adding a trivial argument does
+    * not make a wrapper do anything.
     */
   def passThrough(d: DefDef, unit: CompilationUnit)(using Context): Option[PassThroughFact] =
     val sym = d.symbol
@@ -63,17 +74,65 @@ object SlopMetrics:
         callOf(strip(d.rhs)) match
           case (fun @ Select(qual, _), args)
               if fun.symbol.exists && !fun.symbol.isConstructor && fun.symbol.owner != sym.owner &&
-                !qual.isInstanceOf[This] && !qual.isInstanceOf[Super] &&
-                args.size == params.size && args.map(argSymbol) == params =>
-            Some(
-              PassThroughFact(
-                unit.source.file.path,
-                MemberMetrics.lineOf(unit, d.span.point),
-                sym.fullName.toString,
-                fun.symbol.fullName.toString
+                !qual.isInstanceOf[This] && !qual.isInstanceOf[Super] =>
+            val passed = args.map(argSymbol)
+            val extras = args.zip(passed).filter { case (_, s) => !params.contains(s) }.map(_._1)
+            if params.forall(p => passed.count(_ == p) == 1) && extras.size <= 1 && extras.forall(trivialArg) then
+              Some(
+                PassThroughFact(
+                  unit.source.file.path,
+                  MemberMetrics.lineOf(unit, d.span.point),
+                  sym.fullName.toString,
+                  fun.symbol.fullName.toString
+                )
               )
-            )
+            else None
           case _ => None
+
+  /** The case class built by `new C(..)` or `C(..)`, if the call builds one. */
+  def constructed(t: Apply)(using Context): Option[String] =
+    val fn = t.fun.symbol
+    if !fn.exists then None
+    else if fn.isConstructor && fn.owner.is(Flags.CaseClass) then Some(fn.owner.fullName.toString)
+    else if fn.name.toString == "apply" && fn.is(Flags.Synthetic) && fn.owner.is(Flags.ModuleClass) &&
+      fn.owner.companionClass.is(Flags.CaseClass)
+    then Some(fn.owner.companionClass.fullName.toString)
+    else None
+
+  /** Case classes with at least this many fields are tracked as possible parameter bundles. */
+  val minTrackedFields = 3
+
+  def bundleCandidate(sym: Symbol)(using Context): Boolean =
+    sym.isClass && sym.is(Flags.CaseClass) && !sym.is(Flags.ModuleClass) &&
+      sym.primaryConstructor.exists && sym.primaryConstructor.paramSymss.flatten.count(_.isTerm) >= minTrackedFields
+
+  /** The case classes taken as explicit parameters by a method. */
+  def bundleParams(d: DefDef, unit: CompilationUnit)(using Context): List[BundleUse] =
+    val sym = d.symbol
+    if !memberMethod(d, unit) then Nil
+    else
+      d.paramss.flatten.collect {
+        case v: ValDef if !v.symbol.isOneOf(Flags.GivenOrImplicit) && v.tpt.tpe.widen.classSymbol.is(Flags.CaseClass) =>
+          BundleUse(
+            unit.source.file.path, MemberMetrics.lineOf(unit, d.span.point), "param",
+            v.tpt.tpe.widen.classSymbol.fullName.toString, sym.fullName.toString
+          )
+      }.distinctBy(_.sym)
+
+  /** A case class with enough fields to be a parameter bundle. */
+  def bundleDecl(td: TypeDef, unit: CompilationUnit)(using Context): Option[BundleDecl] =
+    val sym = td.symbol
+    td.rhs match
+      case impl: Template if sym.isClass && sym.is(Flags.CaseClass) && !sym.is(Flags.ModuleClass) && td.span.exists =>
+        val fields = sym.primaryConstructor.paramSymss.flatten.count(_.isTerm)
+        val behaviour = impl.body.exists {
+          case d: DefDef => !d.symbol.isConstructor && !d.symbol.is(Flags.Synthetic)
+          case v: ValDef => !v.symbol.is(Flags.ParamAccessor) && !v.symbol.is(Flags.Synthetic)
+          case _         => false
+        }
+        val derives = sym.companionModule.exists && sym.companionModule.moduleClass.info.decls.toList.exists(_.is(Flags.Given))
+        Some(BundleDecl(unit.source.file.path, MemberMetrics.lineOf(unit, td.span.point), sym.fullName.toString, fields, behaviour, derives))
+      case _ => None
 
   private def typeToken(tpe: Type)(using Context): String = tpe.widenDealias match
     case AppliedType(tycon, args) => typeToken(tycon) + args.map(typeToken).mkString("[", ",", "]")

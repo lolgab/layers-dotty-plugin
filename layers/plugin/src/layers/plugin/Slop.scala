@@ -7,7 +7,37 @@ object Slop:
     val all = facts.toList
     (passThroughs(all.flatMap(_.passThroughs)) ++
       clones(all.flatMap(_.clones), math.max(t.minCloneSize, SlopMetrics.cloneFloor)) ++
-      singleImplementations(all.flatMap(_.typeDecls))).sortBy(f => (f.file, f.line, f.key))
+      singleImplementations(all.flatMap(_.typeDecls)) ++
+      parameterObjects(all.flatMap(_.bundles), all.flatMap(_.bundleUses), t)).sortBy(f => (f.file, f.line, f.key))
+
+  /** A case class that exists only to carry arguments from one call site into one method: it was introduced to get
+    * under a parameter limit and hides the long list without naming a concept. Data that is built in several places,
+    * passed to several methods, given behaviour or derived instances is a real type.
+    */
+  private def parameterObjects(decls: List[BundleDecl], uses: List[BundleUse], t: Thresholds): List[Finding] =
+    // `copy`, `fromProduct` and the like are generated and build the class from inside it
+    val built = uses.filter(u => u.kind == "new" && u.from != "<none>" && !u.from.startsWith(u.sym)).groupBy(_.sym)
+    val passed = uses.filter(_.kind == "param").groupBy(_.sym)
+    val mentioned = uses.filter(_.kind == "ref").groupBy(_.sym)
+    decls.filter(d => d.fields >= t.minBundleFields && !d.hasBehaviour && !d.derives).flatMap { d =>
+      val sites = built.getOrElse(d.sym, Nil).map(_.from).distinct
+      val receivers = passed.getOrElse(d.sym, Nil).map(_.from).distinct
+      // The type also appears in a return type, a field or another method's signature: it flows around, it is data.
+      val elsewhere = mentioned.getOrElse(d.sym, Nil).map(_.from).distinct
+        .filterNot(f => f == "<none>" || f.startsWith(d.sym) || sites.contains(f) || receivers.contains(f))
+      if sites.size == 1 && receivers.size == 1 && built(d.sym).size == 1 && elsewhere.isEmpty then
+        val text =
+          s"`${d.sym}` is a single-use parameter object: it is built once, in `${sites.head}`, and read by one method, " +
+            s"`${receivers.head}`.\n" +
+            "  Principle: a parameter object should name a concept. One that only carries arguments across a single " +
+            "call hides the long parameter list, it does not remove it.\n" +
+            "  Fix with one of:\n" +
+            "    - Inline it: pass the values, and reduce what the method needs (it probably does more than one thing).\n" +
+            "    - If the values do belong together, give the class behaviour or use it in more than one place.\n" +
+            s"  Done when `${d.sym}` is built or taken in more than one place, has behaviour, or is removed."
+        Some(Finding(s"bundle ${d.sym}", d.fields, d.file, d.line, text))
+      else None
+    }
 
   private def passThroughs(facts: List[PassThroughFact]): List[Finding] =
     facts.map { p =>

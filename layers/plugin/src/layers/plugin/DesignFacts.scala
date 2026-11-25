@@ -28,11 +28,17 @@ final case class ClassDep(
 /** Raw measurements of one method, kept unevaluated so thresholds can change without recompiling.
   *
   * @param lines
-  *   source lines the definition spans
+  *   source lines the definition spans (used to point at the code, never to judge it)
+  * @param size
+  *   logical lines: non-blank code characters (comments left out) at 30 per line, so reformatting cannot change it
   * @param params
   *   explicit value parameters over all parameter lists
   * @param nesting
   *   deepest nesting of branches, loops and closures
+  * @param pkg
+  *   package the method is declared in: a call across packages is a module boundary, not a method split
+  * @param entry
+  *   overrides an inherited member: it is called through its parent type, so the callers seen here are not all of them
   */
 final case class MethodFact(
     file: String,
@@ -41,17 +47,32 @@ final case class MethodFact(
     cyclomatic: Int,
     cognitive: Int,
     lines: Int,
+    size: Int,
     params: Int,
-    nesting: Int
+    nesting: Int,
+    priv: Boolean = false,
+    calls: List[String] = Nil,
+    entry: Boolean = false,
+    pkg: String = ""
 )
 
-/** Cohesion of one class or trait with at least two methods.
+/** One method of a class, as far as cohesion is concerned.
   *
-  * @param clusters
-  *   LCOM4: groups of methods that are connected by shared fields or calls; more than one group means the class holds
-  *   unrelated responsibilities
+  * @param types
+  *   domain types (outermost class names) in the signature: what the method works on
+  * @param calls
+  *   sibling methods it calls
+  * @param fields
+  *   fields of the class it reads or writes
   */
-final case class ClassFact(file: String, line: Int, sym: String, methods: Int, clusters: List[List[String]])
+final case class ClassMethod(name: String, types: List[String], calls: List[String], fields: List[String])
+
+/** What the cohesion and facade checks need to know about one class or trait.
+  *
+  * @param exports
+  *   members that are only `export` forwarders, which say nothing about what the class itself does
+  */
+final case class ClassFact(file: String, line: Int, sym: String, methods: List[ClassMethod], exports: Int = 0)
 
 /** A public-looking method that only forwards its parameters, unchanged and in order, to a method of another class. */
 final case class PassThroughFact(file: String, line: Int, sym: String, target: String)
@@ -88,6 +109,20 @@ final case class TypeDecl(
     parents: List[String]
 )
 
+/** A case class that could be a bundle of parameters.
+  *
+  * @param fields
+  *   constructor parameters
+  * @param hasBehaviour
+  *   declares methods or state beyond the fields
+  * @param derives
+  *   a serialisation or typeclass instance is derived, so it is data, not a bundle
+  */
+final case class BundleDecl(file: String, line: Int, sym: String, fields: Int, hasBehaviour: Boolean, derives: Boolean)
+
+/** Where a case class is built (`kind` = "new") or taken as an explicit parameter by method `from` (`kind` = "param"). */
+final case class BundleUse(file: String, line: Int, kind: String, sym: String, from: String)
+
 /** Everything the design checks need to know about one source file, independent of the compiler run that saw it.
   *
   * @param source
@@ -110,6 +145,12 @@ final case class TypeDecl(
   *   classes, traits and objects declared in this file
   * @param classDeps
   *   which top-level class uses which, including within a package
+  * @param bundles
+  *   case classes that could be parameter bundles
+  * @param bundleUses
+  *   where those and other case classes are built and passed
+  * @param lines
+  *   length of the source file
   */
 final case class FileFacts(
     source: String,
@@ -121,12 +162,16 @@ final case class FileFacts(
     passThroughs: List[PassThroughFact] = Nil,
     clones: List[CloneFact] = Nil,
     typeDecls: List[TypeDecl] = Nil,
-    classDeps: List[ClassDep] = Nil
+    classDeps: List[ClassDep] = Nil,
+    bundles: List[BundleDecl] = Nil,
+    bundleUses: List[BundleUse] = Nil,
+    lines: Int = 0,
+    arch: List[ArchFact] = Nil
 )
 
 object FileFacts:
   /** Bump whenever extraction changes what the facts mean: older facts cannot be recomputed without recompiling. */
-  val version = 4
+  val version = 10
 
   private val header = s"layers-facts\t$version"
 
@@ -135,6 +180,10 @@ object FileFacts:
     content.linesIterator.drop(1).nextOption().map(_.split('\t')).collect { case Array("source", source) => source }
 
   private def clean(s: String): String = s.replace('\t', ' ').replace('\n', ' ')
+
+  private def listItem(s: String): String = clean(s).replace(',', '_').replace('|', '_').replace(';', '_')
+
+  private def list(s: String): List[String] = if s.isEmpty then Nil else s.split(",", -1).toList
 
   def encode(f: FileFacts): String =
     val sb = new StringBuilder
@@ -145,12 +194,16 @@ object FileFacts:
       sb.append("types\t").append(clean(p)).append('\t').append(total).append('\t').append(abs).append('\n')
     for m <- f.methods do
       sb.append("method\t").append(m.line).append('\t').append(clean(m.sym)).append('\t')
-        .append(m.cyclomatic).append('\t').append(m.cognitive).append('\t').append(m.lines).append('\t')
-        .append(m.params).append('\t').append(m.nesting).append('\n')
+        .append(m.cyclomatic).append('\t').append(m.cognitive).append('\t').append(m.lines).append('\t').append(m.size).append('\t')
+        .append(m.params).append('\t').append(m.nesting).append('\t').append((if m.priv then 1 else 0) + (if m.entry then 2 else 0)).append('\t')
+        .append(m.calls.map(listItem).mkString(",")).append('\t').append(clean(m.pkg)).append('\n')
     for c <- f.classes do
-      val clusters = c.clusters.map(_.map(clean(_).replace(',', '_').replace(';', '_')).mkString(",")).mkString(";")
+      val methods = c.methods.map { m =>
+        List(m.name, m.types.map(listItem).mkString(","), m.calls.map(listItem).mkString(","), m.fields.map(listItem).mkString(","))
+          .map(x => x.replace('|', '_').replace(';', '_')).mkString("|")
+      }.mkString(";")
       sb.append("class\t").append(c.line).append('\t').append(clean(c.sym)).append('\t')
-        .append(c.methods).append('\t').append(clusters).append('\n')
+        .append(c.exports).append('\t').append(methods).append('\n')
     for x <- f.passThroughs do
       sb.append("passthrough\t").append(x.line).append('\t').append(clean(x.sym)).append('\t').append(clean(x.target)).append('\n')
     for x <- f.clones do
@@ -163,6 +216,14 @@ object FileFacts:
     for x <- f.classDeps do
       sb.append("classdep\t").append(x.line).append('\t').append(clean(x.fromTop)).append('\t').append(clean(x.toTop)).append('\t')
         .append(clean(x.fromPkg)).append('\t').append(clean(x.toPkg)).append('\t').append(x.refs).append('\n')
+    sb.append("lines\t").append(f.lines).append('\n')
+    for x <- f.arch do sb.append(ArchFact.encode(x)).append('\n')
+    for x <- f.bundles do
+      sb.append("bundle\t").append(x.line).append('\t').append(clean(x.sym)).append('\t').append(x.fields).append('\t')
+        .append(if x.hasBehaviour then 1 else 0).append('\t').append(if x.derives then 1 else 0).append('\n')
+    for x <- f.bundleUses do
+      sb.append("bundleuse\t").append(x.line).append('\t').append(x.kind).append('\t').append(clean(x.sym)).append('\t')
+        .append(clean(x.from)).append('\n')
     for e <- f.edges do
       sb.append("edge\t").append(e.line).append('\t')
         .append(clean(e.fromPkg)).append('\t').append(clean(e.fromSym)).append('\t')
@@ -187,12 +248,17 @@ object FileFacts:
           }.toMap
           def ints(xs: String*) = xs.forall(_.toIntOption.isDefined)
           val methods = body.collect {
-            case Array("method", line, sym, cyc, cog, lines, params, nest) if ints(line, cyc, cog, lines, params, nest) =>
-              MethodFact(source, line.toInt, sym, cyc.toInt, cog.toInt, lines.toInt, params.toInt, nest.toInt)
+            case Array("method", line, sym, cyc, cog, lines, size, params, nest, priv, calls, pkg)
+                if ints(line, cyc, cog, lines, size, params, nest, priv) =>
+              val flags = priv.toInt
+              MethodFact(source, line.toInt, sym, cyc.toInt, cog.toInt, lines.toInt, size.toInt, params.toInt, nest.toInt, (flags & 1) != 0, list(calls), (flags & 2) != 0, pkg)
           }
           val classes = body.collect {
-            case Array("class", line, sym, n, clusters) if ints(line, n) =>
-              ClassFact(source, line.toInt, sym, n.toInt, clusters.split(";").toList.map(_.split(",").toList))
+            case Array("class", line, sym, exports, methods) if ints(line, exports) =>
+              val ms = if methods.isEmpty then Nil else methods.split(";", -1).toList.map(_.split("\\|", -1)).collect {
+                case Array(name, types, calls, fields) => ClassMethod(name, list(types), list(calls), list(fields))
+              }
+              ClassFact(source, line.toInt, sym, ms, exports.toInt)
           }
           val passThroughs = body.collect {
             case Array("passthrough", line, sym, target) if ints(line) => PassThroughFact(source, line.toInt, sym, target)
@@ -212,19 +278,32 @@ object FileFacts:
             case Array("classdep", line, ft, tt, fp, tp, refs) if ints(line, refs) =>
               ClassDep(source, line.toInt, ft, tt, fp, tp, refs.toInt)
           }
+          val bundles = body.collect {
+            case Array("bundle", line, sym, fields, behaviour, derives) if ints(line, fields) =>
+              BundleDecl(source, line.toInt, sym, fields.toInt, behaviour == "1", derives == "1")
+          }
+          val bundleUses = body.collect {
+            case Array("bundleuse", line, kind, sym, from) if ints(line) => BundleUse(source, line.toInt, kind, sym, from)
+          }
+          val arch = body.flatMap(ArchFact.decode(source, _))
+          val lineCount = body.collectFirst { case Array("lines", n) if n.toIntOption.isDefined => n.toInt }.getOrElse(0)
           val wellFormed = body.forall {
+            case Array("lines", n) => n.toIntOption.isDefined
+            case Array("bundle", line, _, fields, _, _) => ints(line, fields)
+            case Array("bundleuse", line, _, _, _)      => ints(line)
             case Array("classdep", line, _, _, _, _, refs) => ints(line, refs)
             case Array("passthrough", line, _, _)        => ints(line)
             case Array("clone", line, _, size, _)        => ints(line, size)
             case Array("typedecl", line, _, _, _, _, _)  => ints(line)
-            case Array("method", line, _, cyc, cog, lines, params, nest) => ints(line, cyc, cog, lines, params, nest)
-            case Array("class", line, _, n, _)                           => ints(line, n)
+            case Array("method", line, _, cyc, cog, lines, size, params, nest, flags, _, _) => ints(line, cyc, cog, lines, size, params, nest, flags)
+            case Array("class", line, _, exports, _)                           => ints(line, exports)
+            case Array("arch", _, line, _*)         => line.toIntOption.isDefined
             case Array("pkg", _)                    => true
             case Array("types", _, total, abs)      => total.toIntOption.isDefined && abs.toIntOption.isDefined
             case Array("edge", line, _, _, _, _)    => line.toIntOption.isDefined
             case _                                  => false
           }
-          if wellFormed then Some(FileFacts(source, packages, edges, types, methods, classes, passThroughs, clones, typeDecls, classDeps)) else None
+          if wellFormed then Some(FileFacts(source, packages, edges, types, methods, classes, passThroughs, clones, typeDecls, classDeps, bundles, bundleUses, lineCount, arch)) else None
         }
       case _ => None
 

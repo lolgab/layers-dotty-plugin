@@ -3,6 +3,7 @@ package layers.plugin
 import dotty.tools.dotc.core.Contexts.Context
 import dotty.tools.dotc.core.Flags
 import dotty.tools.dotc.core.Symbols.*
+import dotty.tools.dotc.core.Types.*
 
 object SymbolNames:
 
@@ -24,3 +25,14 @@ object SymbolNames:
   def topLevelName(sym: Symbol)(using Context): String =
     val top = sym.topLevelClass
     if top.exists then top.fullName.toString.stripSuffix("$") else ""
+
+  /** The classes a type mentions, through type arguments and unions, without primitives. */
+  def classesIn(tpe: Type)(using Context): Set[Symbol] =
+    tpe match
+      case ref: TypeRef =>
+        val sym = ref.symbol
+        if sym.exists && !sym.isPrimitiveValueClass then Set(sym) else Set.empty
+      case app: AppliedType => classesIn(app.tycon) ++ app.args.flatMap(classesIn)
+      case and: AndType     => classesIn(and.tp1) ++ classesIn(and.tp2)
+      case or: OrType       => classesIn(or.tp1) ++ classesIn(or.tp2)
+      case _                => Set.empty

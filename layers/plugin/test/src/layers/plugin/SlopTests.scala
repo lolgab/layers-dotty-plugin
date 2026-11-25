@@ -78,6 +78,15 @@ class SlopTests extends FunSuite:
     assertEquals(Slop.findings(List(facts(typeDecls = List(decl("p.Store", "trait")))), t), Nil)
   }
 
+  test("bundle facts survive the codec") {
+    val f = FileFacts(
+      "F.scala", Set("p"), Nil, Map.empty, Nil, Nil, Nil, Nil, Nil, Nil,
+      List(BundleDecl("F.scala", 2, "p.Args", 4, hasBehaviour = false, derives = true)),
+      List(BundleUse("F.scala", 5, "new", "p.Args", "p.S.run"), BundleUse("F.scala", 6, "param", "p.Args", "p.S.work"))
+    )
+    assertEquals(FileFacts.decode(FileFacts.encode(f)).map(_.copy(source = "F.scala")), Some(f))
+  }
+
   test("slop facts survive the codec") {
     val f = facts(
       List(PassThroughFact("F.scala", 3, "p.S.find", "p.R.find")),

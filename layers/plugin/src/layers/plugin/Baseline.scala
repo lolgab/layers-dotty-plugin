@@ -6,8 +6,23 @@ package layers.plugin
   *   stable identity, e.g. `cyclomatic app.Service.run` or `sdp app -> util`
   * @param value
   *   measured amount; 0 for yes/no findings
+  * @param ranges
+  *   line ranges that make up the finding, when more than the line it is reported at (a method and the single-use
+  *   helpers counted with it)
   */
-final case class Finding(key: String, value: Int, file: String, line: Int, message: String)
+final case class Finding(
+    key: String,
+    value: Int,
+    file: String,
+    line: Int,
+    message: String,
+    ranges: List[(Int, Int)] = Nil
+):
+  /** The kind of check, e.g. `cyclomatic` for `cyclomatic app.Service.run`. */
+  def kind: String = key.takeWhile(_ != ' ')
+
+  /** Source lines the finding is about: where it would be fixed. */
+  def lines: List[(Int, Int)] = if ranges.isEmpty then List((line, line)) else ranges
 
 /** Accepted legacy findings, each with the worst value that is still accepted. Anything new or worse fails the build.
   * Tooling only lowers or removes entries, so raising one is always a visible, deliberate edit of the file.
