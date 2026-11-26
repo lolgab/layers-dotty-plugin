@@ -39,7 +39,8 @@ object ZincIncrementalRunner:
       rounds: List[List[(String, String)]],
       pluginJarPath: String,
       layersJarPath: String,
-      scalaVersion: String = "3.8.1"
+      scalaVersion: String = "3.8.1",
+      extraScalacOptions: Seq[String] = Nil
   ): List[CompilationRoundResult] =
     val tempDir = java.nio.file.Files.createTempDirectory("layers-zinc-test-").toAbsolutePath
     try
@@ -123,7 +124,7 @@ object ZincIncrementalRunner:
           "-Xplugin:" + pluginJarPath,
           "-deprecation",
           "-color:never"
-        )
+        ) ++ extraScalacOptions
 
         val inputs = inc.inputs(
           classpath = classpath,

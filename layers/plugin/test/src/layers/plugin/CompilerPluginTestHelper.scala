@@ -32,23 +32,26 @@ object CompilerPluginTestHelper:
       sources: List[(String, String)],
       pluginJarPath: String,
       layersOptions: String | List[String] = Nil,
-      outputDir: Option[java.nio.file.Path] = None
+      outputDir: Option[java.nio.file.Path] = None,
+      sourceDir: Option[java.nio.file.Path] = None
   ): CompilationResult =
     val opts = layersOptions match
       case s: String     => List(s)
       case l: List[?]    => l.asInstanceOf[List[String]]
-    compileWithOptions(sources, pluginJarPath, opts, outputDir)
+    compileWithOptions(sources, pluginJarPath, opts, outputDir, sourceDir)
 
   private def compileWithOptions(
       sources: List[(String, String)],
       pluginJarPath: String,
       layersOptions: List[String],
-      outputDir: Option[java.nio.file.Path]
+      outputDir: Option[java.nio.file.Path],
+      sourceDir: Option[java.nio.file.Path]
   ): CompilationResult =
     val tempDir = outputDir.getOrElse(Files.createTempDirectory("layers-plugin-test-"))
-    val sourceDir = Files.createTempDirectory("layers-plugin-test-sources-")
+    val keepSources = sourceDir.isDefined
+    val srcDir = sourceDir.getOrElse(Files.createTempDirectory("layers-plugin-test-sources-"))
     val filePaths = sources.map { case (name, content) =>
-      val path = sourceDir.resolve(name)
+      val path = srcDir.resolve(name)
       Files.createDirectories(path.getParent)
       Files.writeString(path, content)
       path.toAbsolutePath.toString
@@ -80,5 +83,6 @@ object CompilerPluginTestHelper:
         Some(tempDir)
       )
     finally
-      filePaths.foreach(p => Files.deleteIfExists(java.nio.file.Paths.get(p)))
-      Files.deleteIfExists(sourceDir)
+      if !keepSources then
+        filePaths.foreach(p => Files.deleteIfExists(java.nio.file.Paths.get(p)))
+        Files.deleteIfExists(srcDir)

@@ -9,4 +9,5 @@ class LayersPlugin extends StandardPlugin:
   override val description: String = "Enforces package dependencies via @dependsOnPackages/@dependsOnLayers annotations on the layer object"
 
   override def initialize(options: List[String])(using Context): List[PluginPhase] =
-    (new AnnotationLayersPhase(options)) :: Nil
+    val design = if options.contains("design") then List(new DesignGraphPhase(options)) else Nil
+    new AnnotationLayersPhase(options) :: design

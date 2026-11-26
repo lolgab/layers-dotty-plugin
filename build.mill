@@ -42,6 +42,8 @@ object layers extends ScalaModule with Publish {
     object test extends ScalaTests with TestModule.Munit {
       def moduleDeps = Seq(layers)
       def compileModuleDeps = Seq(outer)
+      // Pure analysis classes (facts, cycles) are unit tested directly.
+      def runModuleDeps = Seq(outer)
       def mvnDeps = Seq(
         mvn"org.scalameta::munit:1.1.0",
         mvn"org.scala-lang::scala3-compiler:$crossScalaVersion",
